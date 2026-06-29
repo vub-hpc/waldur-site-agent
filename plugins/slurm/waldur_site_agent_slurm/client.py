@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
 from waldur_site_agent.backend import clients
+from waldur_site_agent.backend import logger
 from waldur_site_agent.backend import utils as backend_utils
 from waldur_site_agent.backend.exceptions import (
     BackendError,
@@ -17,6 +19,7 @@ from waldur_site_agent_slurm.parser import SlurmAssociationLine, SlurmReportLine
 
 _PARTITION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+WALDUR_SCRIPT_PREFIX = "/usr/local/bin/"
 
 class SlurmClient(clients.BaseClient):
     """This class implements Python client for SLURM.
@@ -753,3 +756,10 @@ class SlurmClient(clients.BaseClient):
                 billing_units += usage * weight
 
         return billing_units
+
+    def create_linux_user_homedir(self, username: str, umask: str = "") -> str:
+        """Creates homedir for the user in Linux system."""
+        waldur_make_homedir_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_homedir_vsc")
+        command = ["sudo", waldur_make_homedir_vsc, username]
+        logger.info(f"Executing: {' '.join(command)}")
+        return self.execute_command(command)
