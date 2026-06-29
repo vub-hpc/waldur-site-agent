@@ -588,16 +588,17 @@ class SlurmClient(clients.BaseClient):
         default_account: Optional[str] = "",
     ) -> str:
         """Create an association between a user and account with a specific partition."""
-        return self._execute_command(
-            [
-                "add",
-                "user",
-                username,
-                f"account={resource_id}",
-                f"DefaultAccount={default_account}",
-                f"Partition={partition}",
-            ]
-        )
+        command = [
+            "add",
+            "user",
+            username,
+            f"account={resource_id}",
+            f"Partition={partition}",
+        ]
+        if default_account:
+            command.append(f"DefaultAccount={default_account}")
+
+        return self._execute_command(command, silent=True)
 
     def create_association_with_partitions(
         self,
@@ -628,11 +629,12 @@ class SlurmClient(clients.BaseClient):
             "user",
             username,
             f"account={resource_id}",
-            f"DefaultAccount={default_account}",
             f"Partitions={','.join(sorted_parts)}",
             "Share=parent",
         ]
-        return self._execute_command(args)
+        if default_account:
+            args.append(f"DefaultAccount={default_account}")
+        return self._execute_command(args, silent=True)
 
     # ===== PERIODIC LIMITS EXTENSION =====
 
