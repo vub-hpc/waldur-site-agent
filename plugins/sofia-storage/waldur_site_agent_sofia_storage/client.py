@@ -93,6 +93,10 @@ class SofiaStorageClient(BaseClient):
 
     def sudo_waldur_make_homedir_vsc(self, username: str) -> str:
         """Launch standalone waldur_make_homedir_vsc script"""
+        homedir_path = os.path.join(self.home_path, username)
+        if os.path.isdir(homedir_path):
+            return f"Home directory of {username} already exists"
+
         waldur_make_homedir_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_homedir_vsc")
         command = ["sudo", waldur_make_homedir_vsc, username]
         logger.info(f"Executing: {' '.join(command)}")

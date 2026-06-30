@@ -130,7 +130,7 @@ class SofiaStorageBackend(BaseBackend):
         if not self.vsc_client:
             raise BackendError("Cannot create storage resource without VSC account page integration")
 
-        project_group, project_gid = self.vsc_client.make_project_group(
+        project_group, project_gid = self.vsc_client.update_project_group(
             project_slug=project_slug,
             project_name=project_name,
             members=project_members,
@@ -181,6 +181,24 @@ class SofiaStorageBackend(BaseBackend):
         except Exception as err:
             logger.error("Failed to disable storage quota for %s: %s", project_slug, err)
 
+    def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
+        """Add user to VSC group of the resource"""
+        del kwargs
+
+        project_slug = waldur_resource.project_slug
+        self.vsc_client.add_user_to_project(project_slug, username)
+
+        return True
+
+    def remove_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
+        """Remove user from VSC group of the resource"""
+        del kwargs
+
+        project_slug = waldur_resource.project_slug
+        self.vsc_client.remove_user_to_project(project_slug, username)
+
+        return True
+
     def _get_usage_report(self, resource_backend_ids: list[str]) -> dict:
         """Return usage report for the specified resources.
 
@@ -198,8 +216,11 @@ class SofiaStorageBackend(BaseBackend):
         """
         report = {}
         for rbi in resource_backend_ids:
-            fileset_name = rbi[:rbi.rfind("-")]
-            res_usage, res_quota = self.client.get_quota(fileset_name)
+            res_data = self.client.sudo_waldur_get_project_quota(rbi).splitlines()
+            res_usage = float(res_data[0])
+
+            component_data = self.backend_components[OFFERING_COMPONENT]
+            unit_factor = float(component_data.get("unit_factor", 1))
 
             report[rbi] = {
                 "TOTAL_ACCOUNT_USAGE": {

@@ -77,9 +77,9 @@ class VscBackend:
 
         return True
 
-    def make_project_group(self, project_slug: str, project_name: str, members: list, moderators: list) -> str:
+    def update_project_group(self, project_slug: str, project_name: str, members: list, moderators: list) -> str:
         """
-        Ensure VSC group exists for a project.
+        Update VSC group for a given project. Create a new one if one does not exist yet.
 
         Args:
             project_slug: Project slug (used as group name)
@@ -131,3 +131,18 @@ class VscBackend:
         self.update_autogroup_source(group_name)
 
         return self.get_project_group_ids(project_slug)
+
+
+    def add_user_to_project(self, project_slug: str, username: str) -> bool:
+        """ Add user to VSC group of given project """
+        group_name, group_gid = self.get_project_group_ids(project_slug)
+        logger.info(f"Adding member to VSC group {group_name}: {username}")
+        self.client.group[group_name].member[username].post(body={'vsc_id': username})
+        return True
+
+    def remove_user_to_project(self, project_slug: str, username: str) -> bool:
+        """ Remove user from VSC group of given project """
+        group_name, group_gid = self.get_project_group_ids(project_slug)
+        logger.info(f"Removing member from VSC group {group_name}: {username}")
+        self.client.group[group_name].member[username].delete()
+        return True
