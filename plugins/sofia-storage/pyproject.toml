@@ -1,6 +1,6 @@
 [project]
 name = "waldur-site-agent-sofia-storage"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sofia cluster GPFS storage plugin for Waldur Site Agent"
 readme = "README.md"
 authors = [{ name = "VUB HPC Team", email = "hpc@vub.be" }]

@@ -19,15 +19,11 @@ DEFAULT_HOME_PATH = "/home"
 
 class SofiaStorageBackend(BaseBackend):
     """Sofia Storage backend."""
+    supports_decreasing_usage = True
 
     def __init__(self, backend_settings: dict, backend_components: dict[str, dict]) -> None:
         super().__init__(backend_settings, backend_components)
         self.backend_type = "sofia_storage"
-
-        self.storage_fs = backend_settings.get("storage_file_system", DEFAULT_FILESYSTEM)
-        self.storage_path = backend_settings.get("storage_path", DEFAULT_STORAGE_PATH)
-        self.home_path = backend_settings.get("home_path", DEFAULT_HOME_PATH)
-        self.client = SofiaStorageClient(self.storage_fs, self.storage_path, self.home_path)
 
         self.vsc_client = None
         vsc_token = backend_settings.get("vsc_token")
@@ -40,6 +36,20 @@ class SofiaStorageBackend(BaseBackend):
                 autogroup_name=vsc_autogroup,
                 group_prefix=vsc_group_prefix,
             )
+
+        component_data = self.backend_components[OFFERING_COMPONENT]
+        self.unit_factor = float(component_data.get("unit_factor", 1))
+
+        self.storage_fs = backend_settings.get("storage_file_system", DEFAULT_FILESYSTEM)
+        self.storage_path = backend_settings.get("storage_path", DEFAULT_STORAGE_PATH)
+        self.home_path = backend_settings.get("home_path", DEFAULT_HOME_PATH)
+        self.client = SofiaStorageClient(
+            filesystem=self.storage_fs,
+            storage_path=self.storage_path,
+            home_path=self.home_path,
+            unit_factor=self.unit_factor,
+            vsc_group_prefix=vsc_group_prefix,
+        )
 
     def ping(self, raise_exception: bool = False) -> bool:
         """Check if GPFS commands are accessible."""
@@ -216,17 +226,24 @@ class SofiaStorageBackend(BaseBackend):
         """
         report = {}
         for rbi in resource_backend_ids:
-            res_data = self.client.sudo_waldur_get_project_quota(rbi).splitlines()
-            res_usage = float(res_data[0])
+            rbi_usage = {}
+            res_data = self.client.collect_project_quotas(rbi)
+            for entity, usage, _ in res_data:
+                rbi_entity_usage = float(usage) / self.unit_factor
 
-            component_data = self.backend_components[OFFERING_COMPONENT]
-            unit_factor = float(component_data.get("unit_factor", 1))
+                if entity == "fileset":
+                    rbi_entity_name = "TOTAL_ACCOUNT_USAGE"
+                else:
+                    # username
+                    rbi_entity_name = entity
 
-            report[rbi] = {
-                "TOTAL_ACCOUNT_USAGE": {
-                    "storage": res_usage
-                }
-            }
+                rbi_usage.update({
+                    rbi_entity_name: {
+                        OFFERING_COMPONENT: rbi_entity_usage,
+                    },
+                })
+
+            report[rbi] = rbi_usage
 
         logger.info(f"Sofia Storage Usage Report: {report}")
         return report
@@ -240,17 +257,16 @@ class SofiaStorageBackend(BaseBackend):
 
         resource_limits = waldur_resource.limits.to_dict() if waldur_resource.limits else {}
 
-        for component_key, data in self.backend_components.items():
-            if component_key in resource_limits:
-                limit_value = resource_limits[component_key]
-                # Convert to GPFS units (e.g. if Waldur is GB and GPFS expects MB)
-                unit_factor = data.get("unit_factor", 1)
-                backend_limits[component_key] = int(limit_value * unit_factor)
-                waldur_limits[component_key] = limit_value
-            else:
-                # Default limit if not set in Waldur
-                backend_limits[component_key] = data.get("limit", 0)
-                waldur_limits[component_key] = data.get("limit", 0)
+
+        if OFFERING_COMPONENT in resource_limits:
+            limit_value = resource_limits[OFFERING_COMPONENT]
+            backend_limits[OFFERING_COMPONENT] = int(limit_value * self.unit_factor)
+            waldur_limits[OFFERING_COMPONENT] = limit_value
+        else:
+            # Default limit if not set in Waldur
+            comp_data = self.backend_components[OFFERING_COMPONENT]
+            backend_limits[OFFERING_COMPONENT] = comp_data.get("limit", 0)
+            waldur_limits[OFFERING_COMPONENT] = comp_data.get("limit", 0)
 
         return backend_limits, waldur_limits
 

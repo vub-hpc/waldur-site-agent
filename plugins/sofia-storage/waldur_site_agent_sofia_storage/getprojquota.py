@@ -7,17 +7,11 @@ WALDUR_CONFIG = "/etc/waldur/waldur-site-agent-config.yaml"
 WALDUR_BACKEND = "sofia_storage"
 
 def main():
-    """Create project dir in sofia_storage backend"""
+    """Retrieve quota of project dir in sofia_storage backend"""
     parser = argparse.ArgumentParser(
-        description=(
-            "Create project directory for given VSC group in the sofia_storage"
-            " backend of waldur-site-agent"
-        )
+        description=("Retrieve quota of project directory in sofia_storage backend of waldur-site-agent")
     )
     parser.add_argument("project", type=str)
-    parser.add_argument("block_limit", type=int)
-    parser.add_argument("owner_uid", type=int)
-    parser.add_argument("owner_gid", type=int)
     args = parser.parse_args()
 
     # Load storage backend
@@ -34,10 +28,10 @@ def main():
         storage_config.backend_settings["home_path"],
     )
 
-    # Make project dir
-    storage_client.create_fileset(args.project)
-    storage_client.set_fileset_quota(fileset_name=args.project, block_limit=args.block_limit)
-    storage_client.set_project_owner(fileset_name=args.project, owner_uid=args.owner_uid, owner_gid=args.owner_gid)
+    # Output project quota
+    block_usage, block_limit = storage_client.get_quota(fileset_name=args.project)
+    print(block_usage)
+    print(block_limit)
 
 if __name__ == "__main__":
     main()
