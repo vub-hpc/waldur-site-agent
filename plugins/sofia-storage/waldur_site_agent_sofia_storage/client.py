@@ -1,3 +1,4 @@
+import grp
 import os
 
 from typing import Optional
@@ -7,8 +8,6 @@ from waldur_site_agent.backend import logger
 from waldur_site_agent.backend.clients import BaseClient
 from waldur_site_agent.backend.exceptions import BackendError
 from waldur_site_agent.backend.structures import ClientResource
-
-from .vsc import vsc_project_group_name
 
 GPFS_BIN_PATH = "/usr/lpp/mmfs/bin"
 DEFAULT_INODE_LIMIT = 1 * 1024**2 # 1M
@@ -53,10 +52,23 @@ class SofiaStorageClient(BaseClient):
         """List filesets"""
         return self.operator.list_filesets(devices=self.filesystem)
 
-    def list_resource_users(self, resource_backend_id: str, silent: bool = False) -> list[str]:
-        """Get resource users from local group"""
-        resource_group = vsc_project_group_name(resource_backend_id, self.vsc_group_prefix)
-        command = ["sudo", "getent", "group", resource_group]
+    def list_resource_users(
+        self,
+        resource_backend_id: str,
+        silent: bool = False
+    ) -> list[str]:
+        """Get resource users from local group (avoid VSC AP query)"""
+        fileset_path = os.path.join(self.storage_path, resource_backend_id)
+        try:
+            project_gid = os.stat(fileset_path).st_gid
+            project_group = group_name = grp.getgrgid(project_gid).gr_name
+        except FileNotFoundError:
+            raise BackendError(f"Storage resource {resource_backend_id} not found on local storage")
+        except KeyError:
+            # group still not active
+            return []
+
+        command = ["sudo", "getent", "group", project_group]
         if not silent:
             logger.info(f"Executing: {' '.join(command)}")
         output = self.execute_command(command, silent=silent)
@@ -65,7 +77,7 @@ class SofiaStorageClient(BaseClient):
             group_entry = output.splitlines()[0]
             _, _, _, group_users = group_entry.split(":")
         except ValueError:
-            raise BackendError(f"Failed to retrive users of group: {resource_group}")
+            raise BackendError(f"Failed to retrive users of group: {project_group}")
 
         return group_users.split(",")
 
