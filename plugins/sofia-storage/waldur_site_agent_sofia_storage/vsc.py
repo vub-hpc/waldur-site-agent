@@ -12,16 +12,6 @@ from waldur_site_agent.backend.exceptions import BackendError
 
 VSC_ACCOUNTPAGE_API = "https://account.vscentrum.be/django/api"
 
-def vsc_project_group_name(project_slug: str, group_prefix: str) -> str:
-    """Return VSC group name of given project"""
-    # normalize formatting with underscore separators
-    project_group_name = project_slug.replace("-", "_")
-    # ensure group name starts with 'b'
-    if group_prefix and group_prefix[0] != 'b':
-        group_prefix = f"b{group_prefix}"
-
-    return f"{group_prefix}{project_group_name}"
-
 class VscBackend:
     """Integration class for VSC group management."""
 
@@ -42,6 +32,16 @@ class VscBackend:
 
         self.autogroup = self.get_autogroup(autogroup_name)
 
+    def project_group_name(self, project_slug: str) -> str:
+        """Return VSC group name of given project"""
+        # normalize formatting with underscore separators
+        project_group_name = project_slug.replace("-", "_")
+        # ensure group name starts with 'b'
+        group_prefix = self.group_prefix
+        if group_prefix and group_prefix[0] != 'b':
+            group_prefix = f"b{group_prefix}"
+        return f"{group_prefix}{project_group_name}"
+
     def get_vsc_ids(self, username: str) -> tuple:
         """Return VSC IDs for given user"""
         account = self.client.get_account(username)
@@ -49,13 +49,13 @@ class VscBackend:
 
     def get_project_group_ids(self, project_slug: str) -> dict | None:
         """Get IDs of VSC group of given project"""
-        group_name = vsc_project_group_name(project_slug, self.group_prefix)
+        group_name = self.project_group_name(project_slug)
         group_account = self.client.get_group(group_name)
         return group_account.vsc_id, group_account.vsc_id_number
 
     def get_project_group_members(self, project_slug: str) -> list:
         """Get members of VSC group of given project"""
-        group_name = vsc_project_group_name(project_slug, self.group_prefix)
+        group_name = self.project_group_name(project_slug)
         try:
             response_code, payload = self.client.group[group_name].get()
         except HTTPError as err:
@@ -99,7 +99,7 @@ class VscBackend:
         Returns:
             The group name and GID that was created/updated
         """
-        group_name = vsc_project_group_name(project_slug, self.group_prefix)
+        group_name = self.project_group_name(project_slug)
         description = f"Group for sofia project: {project_name}"
 
         if not members and not moderators:
