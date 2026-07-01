@@ -18,7 +18,16 @@ DEFAULT_STORAGE_PATH = "/gpfs"
 DEFAULT_HOME_PATH = "/home"
 
 class SofiaStorageBackend(BaseBackend):
-    """Sofia Storage backend."""
+    """
+    Sofia Storage backend
+
+    - create VSC group for the project of the resource:
+      group name = {vsc_group_prefix}_{project_slug}
+    - create fileset in GPFS for this resource:
+      fileset name = {resource_backend_id}
+    - mount fileset in local storage:
+      mount path = {storage_path}/{resource_backend_id}
+    """
     supports_decreasing_usage = True
 
     def __init__(self, backend_settings: dict, backend_components: dict[str, dict]) -> None:
@@ -74,15 +83,39 @@ class SofiaStorageBackend(BaseBackend):
         logger.info("Storage Path: %s", self.storage_path)
         return self.ping()
 
-    def _pre_create_resource(
-        self, waldur_resource: WaldurResource, user_context: Optional[dict] = None
-    ) -> None:
-        """Perform actions prior to resource creation.
+    def _get_project_moderators(self, user_context: dict):
+        """Return users with moderator rights in project team"""
+        return [
+            user.username for user in user_context['team']
+            if user.role in ['PROJECT.ADMIN', 'PROJECT.MANAGER']
+        ]
 
-        This backend overrides create_resource entirely, but we must implement
-        this abstract method from BaseBackend to allow instantiation.
-        """
-        pass
+    def _pre_create_resource(
+        self,
+        waldur_resource: WaldurResource,
+        user_context: Optional[dict] = None
+    ) -> None:
+        """Create/Update VSC group for this resource"""
+        if user_context is None:
+            logger.error("Cannot pre-create storage resource without Waldur user context")
+            return
+
+        project_slug = waldur_resource.project_slug
+        project_name = waldur_resource.project_name
+        project_members = [user.username for user in user_context['team']]
+        project_mods = self._get_project_moderators(user_context)
+        logger.info(f"Sofia Storage Backend User context: {project_members} -- {project_mods}")
+
+        # Create VSC group for this project
+        if not self.vsc_client:
+            raise BackendError("Cannot create storage resource without VSC account page integration")
+
+        self.vsc_client.update_project_group(
+            project_slug=project_slug,
+            project_name=project_name,
+            members=project_members,
+            moderators=project_mods,
+        )
 
     def create_resource_with_id(
         self,
@@ -90,24 +123,12 @@ class SofiaStorageBackend(BaseBackend):
         resource_backend_id: str,
         user_context: Optional[dict] = None,
     ) -> BackendResourceInfo:
-        """Create resource with a specific backend ID.
+        """Create GPFS fileset for resource"""
+        if user_context is None:
+            logger.error("Cannot create storage resource without Waldur user context")
+            return
 
-        This method creates a resource with a predetermined backend ID,
-        without any retry logic or uniqueness checking. The calling code
-        (typically the processor) is responsible for ensuring the ID is unique.
-
-        Args:
-            waldur_resource: Resource data from Waldur marketplace
-            resource_backend_id: The specific backend ID to use for the resource
-            user_context: Optional user context including team members and offering users
-
-        Returns:
-            Created backend resource information
-
-        Raises:
-            BackendError: If resource creation fails
-        """
-        logger.info("Creating GPFS storage resource: %s (id: %s)", waldur_resource.name, resource_backend_id)
+        logger.info("Creating sofia storage resource: %s (id: %s)", waldur_resource.name, resource_backend_id)
 
         # Actions prior to resource creation
         self._pre_create_resource(waldur_resource, user_context)
@@ -115,7 +136,9 @@ class SofiaStorageBackend(BaseBackend):
         # Create resource with specific ID
         project_backend_id = self._get_project_backend_id(waldur_resource.project_slug)
         if not self._create_backend_resource(
-            resource_backend_id, waldur_resource.name, project_backend_id, project_backend_id
+            resource_backend_id,
+            waldur_resource.name,
+            project_backend_id,
         ):
             raise BackendError(f"Failed to create backend resource with ID: {resource_backend_id}")
 
@@ -126,53 +149,48 @@ class SofiaStorageBackend(BaseBackend):
             limits=resource_limits,
         )
 
-        # In GPFS, use the project slug as the fileset name
-        project_slug = waldur_resource.project_slug
-        project_name = waldur_resource.project_name
-        project_members = [user.username for user in user_context['team']]
-        project_mods = [
-            user.username for user in user_context['team']
-            if user.role in ['PROJECT.ADMIN', 'PROJECT.MANAGER']
-        ]
-        logger.info(f"Sofia Storage Backend User context: {project_members} -- {project_mods}")
-
-        # Create VSC group for this project
-        if not self.vsc_client:
-            raise BackendError("Cannot create storage resource without VSC account page integration")
-
-        project_group, project_gid = self.vsc_client.update_project_group(
-            project_slug=project_slug,
-            project_name=project_name,
-            members=project_members,
-            moderators=project_mods,
-        )
-
         # Create fileset for project
         limits, waldur_limits = self._collect_resource_limits(waldur_resource)
         storage_limit = limits.get(OFFERING_COMPONENT, 0)
 
+        project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
+        project_mods = self._get_project_moderators(user_context)
         _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
 
         try:
             self.client.sudo_waldur_make_project_vsc(
-                project=project_slug,
+                project_dir=resource_backend_id,
                 block_limit=storage_limit,
                 owner_uid=project_owner_uid,
                 owner_gid=project_gid,
             )
         except Exception as err:
-            raise BackendError(f"Failed to make project directory for project {project_slug}: {err}")
+            raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
+
+        # Actions after resource creation
+        self.post_create_resource(backend_resource_info, waldur_resource, user_context)
+
+        return backend_resource_info
+
+    def post_create_resource(
+        self,
+        resource: BackendResourceInfo,
+        waldur_resource: WaldurResource,
+        user_context: Optional[dict] = None,
+    ) -> None:
+        """Post-create actions for storage resource"""
+        if user_context is None:
+            logger.error("Cannot post-create storage resource without Waldur user context")
+            return
 
         # Home directories of project members
+        project_members = [user.username for user in user_context['team']]
+        project_mods = self._get_project_moderators(user_context)
         for user in project_members + project_mods:
             try:
                 self.client.sudo_waldur_make_homedir_vsc(user)
             except Exception as err:
                 raise BackendError(f"Failed to make home directory for user {user}: {err}")
-
-        # Actions after resource creation
-        self.post_create_resource(backend_resource_info, waldur_resource, user_context)
-        return backend_resource_info
 
     def update_resource(
         self,
@@ -182,14 +200,18 @@ class SofiaStorageBackend(BaseBackend):
         """Update storage resource limits."""
         return self.create_resource(waldur_resource, user_context)
 
-    def delete_resource(self, waldur_resource: WaldurResource, project_slug: str) -> None:
+    def delete_resource(
+        self,
+        waldur_resource: WaldurResource,
+        **kwargs: str,
+    ) -> Optional[str]:
         """Delete storage resource (usually just zero the quota)."""
-        project_slug = waldur_resource.project_slug
-        logger.info("Disabling storage resource (zeroing quota): %s", project_slug)
+        resource_backend_id = waldur_resource.backend_id
+        logger.info(f"Disabling storage resource (zeroing quota): {resource_backend_id}")
         try:
-            self.client.set_quota(fileset_name=project_slug, block_limit=0)
+            self.client.set_fileset_quota(fileset_name=resource_backend_id, block_limit=0)
         except Exception as err:
-            logger.error("Failed to disable storage quota for %s: %s", project_slug, err)
+            logger.error(f"Failed to disable storage quota for {resource_backend_id}: {err}")
 
     def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
         """Add user to VSC group of the resource"""
