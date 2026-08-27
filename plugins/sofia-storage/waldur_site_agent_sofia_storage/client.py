@@ -105,7 +105,9 @@ class SofiaStorageClient(BaseClient):
         return {"storage": float(block_limit) / self.unit_factor}
 
     def set_resource_limits(self, resource_id: str, limits_dict: dict[str, int]) -> str | None:
-        """Sets the limits for the fileset with the specified name.
+        """
+        Sets the limits for the fileset with the specified name.
+        Runs through external script to elevate permissions with sudo.
 
         Args:
             resource_id: Backend identifier for the resource.
@@ -115,13 +117,19 @@ class SofiaStorageClient(BaseClient):
             resource_id
         """
         try:
-            block_limit = float(limits_dict['storage']) * self.unit_factor
+            block_limit = int(limits_dict['storage']) * self.unit_factor
         except KeyError:
             raise BackendError(
                 f"Failed to set limits of {resource_id}.Order does not contain limits for any 'storage' component."
             )
 
-        self.set_fileset_quota(fileset_name=resource_id, block_limit=block_limit)
+        try:
+            self.sudo_waldur_set_project_quota(
+                project_dir=resource_id,
+                block_limit=block_limit,
+            )
+        except Exception as err:
+            raise BackendError(f"Failed to set quota for resource {resource_id}: {err}")
 
         return resource_id
 
@@ -263,5 +271,12 @@ class SofiaStorageClient(BaseClient):
         """Launch standalone waldur_make_project_vsc script"""
         waldur_make_project_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_project_vsc")
         command = ["sudo", waldur_make_project_vsc, project_dir, str(block_limit), str(owner_uid), str(owner_gid)]
+        logger.info(f"Executing: {' '.join(command)}")
+        return self.execute_command(command)
+
+    def sudo_waldur_set_project_quota(self, project_dir: str, block_limit: int) -> str:
+        """Launch standalone waldur_set_project_quota script"""
+        waldur_set_project_quota = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_set_project_quota")
+        command = ["sudo", waldur_set_project_quota, project_dir, str(block_limit)]
         logger.info(f"Executing: {' '.join(command)}")
         return self.execute_command(command)

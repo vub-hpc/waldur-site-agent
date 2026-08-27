@@ -31,3 +31,4 @@ sofia_storage = "waldur_site_agent_sofia_storage.backend:SofiaStorageBackend"
 [project.scripts]
 waldur_make_homedir_vsc = "waldur_site_agent_sofia_storage.mkhomedir:main"
 waldur_make_project_vsc = "waldur_site_agent_sofia_storage.mkprojdir:main"
+waldur_set_project_quota = "waldur_site_agent_sofia_storage.setprojquota:main"
