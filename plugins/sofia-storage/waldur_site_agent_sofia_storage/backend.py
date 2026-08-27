@@ -142,13 +142,6 @@ class SofiaStorageBackend(BaseBackend):
         ):
             raise BackendError(f"Failed to create backend resource with ID: {resource_backend_id}")
 
-        # Setup limits
-        resource_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
-        backend_resource_info = BackendResourceInfo(
-            backend_id=resource_backend_id,
-            limits=resource_limits,
-        )
-
         # Create fileset for project
         limits, waldur_limits = self._collect_resource_limits(waldur_resource)
         storage_limit = limits.get(OFFERING_COMPONENT, 0)
@@ -168,6 +161,12 @@ class SofiaStorageBackend(BaseBackend):
             raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
 
         # Actions after resource creation
+        resource_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
+        backend_resource_info = BackendResourceInfo(
+            backend_id=resource_backend_id,
+            limits=resource_limits,
+        )
+
         self.post_create_resource(backend_resource_info, waldur_resource, user_context)
 
         return backend_resource_info
@@ -191,14 +190,6 @@ class SofiaStorageBackend(BaseBackend):
                 self.client.sudo_waldur_make_homedir_vsc(user)
             except Exception as err:
                 raise BackendError(f"Failed to make home directory for user {user}: {err}")
-
-    def update_resource(
-        self,
-        waldur_resource: WaldurResource,
-        user_context: Optional[dict] = None,
-    ) -> BackendResourceInfo:
-        """Update storage resource limits."""
-        return self.create_resource(waldur_resource, user_context)
 
     def delete_resource(
         self,

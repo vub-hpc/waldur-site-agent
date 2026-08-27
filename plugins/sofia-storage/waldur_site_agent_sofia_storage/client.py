@@ -1,7 +1,7 @@
 import grp
 import os
-
 from typing import Optional
+
 from vsc.filesystem.gpfs import GpfsOperations
 
 from waldur_site_agent.backend import logger
@@ -61,7 +61,7 @@ class SofiaStorageClient(BaseClient):
         fileset_path = os.path.join(self.storage_path, resource_backend_id)
         try:
             project_gid = os.stat(fileset_path).st_gid
-            project_group = group_name = grp.getgrgid(project_gid).gr_name
+            project_group = grp.getgrgid(project_gid).gr_name
         except FileNotFoundError:
             raise BackendError(f"Storage resource {resource_backend_id} not found on local storage")
         except KeyError:
@@ -103,6 +103,27 @@ class SofiaStorageClient(BaseClient):
         """
         _, block_limit = self.get_fileset_quota(fileset_name=resource_id)
         return {"storage": float(block_limit) / self.unit_factor}
+
+    def set_resource_limits(self, resource_id: str, limits_dict: dict[str, int]) -> str | None:
+        """Sets the limits for the fileset with the specified name.
+
+        Args:
+            resource_id: Backend identifier for the resource.
+            limits_dict: {'storage': value}
+
+        Returns:
+            resource_id
+        """
+        try:
+            block_limit = float(limits_dict['storage']) * self.unit_factor
+        except KeyError:
+            raise BackendError(
+                f"Failed to set limits of {resource_id}.Order does not contain limits for any 'storage' component."
+            )
+
+        self.set_fileset_quota(fileset_name=resource_id, block_limit=block_limit)
+
+        return resource_id
 
     def get_fileset_quota(self, fileset_name: str, silent: bool = False) -> tuple:
         """Get quota and usage for a specific fileset."""
@@ -237,7 +258,7 @@ class SofiaStorageClient(BaseClient):
         command = ["sudo", waldur_make_homedir_vsc, username]
         logger.info(f"Executing: {' '.join(command)}")
         return self.execute_command(command)
-    
+
     def sudo_waldur_make_project_vsc(self, project_dir: str, block_limit: int, owner_uid: int, owner_gid: int) -> str:
         """Launch standalone waldur_make_project_vsc script"""
         waldur_make_project_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_project_vsc")
