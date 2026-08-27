@@ -204,9 +204,10 @@ class SofiaStorageBackend(BaseBackend):
             return
 
         logger.info(f"Disabling storage resource (zeroing quota): {resource_backend_id}")
+        zero_block_limit = {'storage': 0}
 
         try:
-            self.client.set_fileset_quota(fileset_name=resource_backend_id, block_limit=0)
+            self.client.set_resource_limits(resource_id=resource_backend_id, limits_dict=zero_block_limit)
         except Exception as err:
             logger.error(f"Failed to disable storage quota for {resource_backend_id}: {err}")
 
