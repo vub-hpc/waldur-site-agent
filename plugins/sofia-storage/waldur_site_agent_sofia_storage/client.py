@@ -117,7 +117,7 @@ class SofiaStorageClient(BaseClient):
             resource_id
         """
         try:
-            block_limit = int(limits_dict['storage']) * self.unit_factor
+            block_limit = int(limits_dict['storage'])
         except KeyError:
             raise BackendError(
                 f"Failed to set limits of {resource_id}.Order does not contain limits for any 'storage' component."
