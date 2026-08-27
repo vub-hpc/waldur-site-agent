@@ -198,7 +198,13 @@ class SofiaStorageBackend(BaseBackend):
     ) -> Optional[str]:
         """Delete storage resource (usually just zero the quota)."""
         resource_backend_id = waldur_resource.backend_id
+
+        if not resource_backend_id:
+            logger.info(f"Ignoring request to delete storage resource with no backend_id")
+            return
+
         logger.info(f"Disabling storage resource (zeroing quota): {resource_backend_id}")
+
         try:
             self.client.set_fileset_quota(fileset_name=resource_backend_id, block_limit=0)
         except Exception as err:
