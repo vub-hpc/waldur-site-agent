@@ -143,9 +143,6 @@ class SofiaStorageBackend(BaseBackend):
             raise BackendError(f"Failed to create backend resource with ID: {resource_backend_id}")
 
         # Create fileset for project
-        limits, waldur_limits = self._collect_resource_limits(waldur_resource)
-        storage_limit = limits.get(OFFERING_COMPONENT, 0)
-
         project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
         project_mods = self._get_project_moderators(user_context)
         _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
@@ -153,20 +150,19 @@ class SofiaStorageBackend(BaseBackend):
         try:
             self.client.sudo_waldur_make_project_vsc(
                 project_dir=resource_backend_id,
-                block_limit=storage_limit,
                 owner_uid=project_owner_uid,
                 owner_gid=project_gid,
             )
         except Exception as err:
             raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
 
-        # Actions after resource creation
+        # Set fileset limits
         resource_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
+
         backend_resource_info = BackendResourceInfo(
             backend_id=resource_backend_id,
             limits=resource_limits,
         )
-
         self.post_create_resource(backend_resource_info, waldur_resource, user_context)
 
         return backend_resource_info

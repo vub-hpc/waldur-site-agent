@@ -15,7 +15,6 @@ def main():
         )
     )
     parser.add_argument("project_dir", type=str)
-    parser.add_argument("block_limit", type=int)
     parser.add_argument("owner_uid", type=int)
     parser.add_argument("owner_gid", type=int)
     args = parser.parse_args()
@@ -36,7 +35,6 @@ def main():
 
     # Make project dir
     storage_client.create_fileset(args.project_dir)
-    storage_client.set_fileset_quota(fileset_name=args.project_dir, block_limit=args.block_limit)
     storage_client.set_project_owner(fileset_name=args.project_dir, owner_uid=args.owner_uid, owner_gid=args.owner_gid)
 
 if __name__ == "__main__":

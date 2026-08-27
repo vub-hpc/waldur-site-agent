@@ -267,10 +267,10 @@ class SofiaStorageClient(BaseClient):
         logger.info(f"Executing: {' '.join(command)}")
         return self.execute_command(command)
 
-    def sudo_waldur_make_project_vsc(self, project_dir: str, block_limit: int, owner_uid: int, owner_gid: int) -> str:
+    def sudo_waldur_make_project_vsc(self, project_dir: str, owner_uid: int, owner_gid: int) -> str:
         """Launch standalone waldur_make_project_vsc script"""
         waldur_make_project_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_project_vsc")
-        command = ["sudo", waldur_make_project_vsc, project_dir, str(block_limit), str(owner_uid), str(owner_gid)]
+        command = ["sudo", waldur_make_project_vsc, project_dir, str(owner_uid), str(owner_gid)]
         logger.info(f"Executing: {' '.join(command)}")
         return self.execute_command(command)
 
