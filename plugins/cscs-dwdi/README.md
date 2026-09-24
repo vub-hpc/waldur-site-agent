@@ -1,12 +1,12 @@
 # CSCS-DWDI Plugin for Waldur Site Agent
 
-This plugin provides integration with the CSCS Data Warehouse Data Intelligence (DWDI) system to report both
-computational and storage usage data to Waldur. The plugin supports secure OIDC authentication and optional
-SOCKS proxy connectivity for accessing DWDI API endpoints from restricted networks.
+This plugin provides integration with the CSCS Data Warehouse Data Intelligence (DWDI) system to report
+compute, storage, and LLM inference usage data to Waldur. The plugin supports secure OIDC authentication and
+optional SOCKS proxy connectivity for accessing DWDI API endpoints from restricted networks.
 
 ## Features
 
-- **Dual Backend Support**: Separate backends for compute and storage resource usage reporting
+- **Multiple Backend Support**: Separate backends for compute, storage, and inference usage reporting
 - **OIDC Authentication**: Secure client credentials flow with automatic token refresh
 - **Proxy Support**: SOCKS and HTTP proxy support for network-restricted environments
 - **Flexible Configuration**: Configurable unit conversions and component mappings
@@ -14,10 +14,11 @@ SOCKS proxy connectivity for accessing DWDI API endpoints from restricted networ
 
 ## Overview
 
-The plugin implements two separate backends to handle different types of accounting data:
+The plugin implements three separate backends to handle different types of accounting data:
 
 - **Compute Backend** (`cscs-dwdi-compute`): Reports CPU and node hour usage from HPC clusters
 - **Storage Backend** (`cscs-dwdi-storage`): Reports storage space and inode usage from filesystems
+- **Inference Backend** (`cscs-dwdi-inference`): Reports LLM inference cost per resource
 
 ## Backend Types
 
@@ -46,6 +47,21 @@ The storage backend queries the DWDI API for storage resource usage and reports:
 
 - `/api/v1/storage/usage-month/filesystem_name/data_type` - Monthly storage usage
 - `/api/v1/storage/usage-day/filesystem_name/data_type` - Daily storage usage
+
+### Inference Backend
+
+The inference backend queries the DWDI API for LLM inference cost and reports:
+
+- Inference cost per resource, already priced by the warehouse (a `totalCost` value)
+- Cost mapped onto a single `token_cost` component, keyed by Waldur resource UUID
+
+Unlike the compute and storage backends — which report raw usage that Waldur then prices — the
+inference backend reports a **pre-computed cost**: the DWDI warehouse owns the pricing and Waldur
+records the amount as-is.
+
+**API Endpoints Used:**
+
+- `/inference/resource/cost` - Monthly inference cost per resource
 
 ## Configuration
 
@@ -109,6 +125,31 @@ backend_components:
     accounting_type: "usage"
     label: "File Count"
 ```
+
+### Inference Backend Configuration
+
+```yaml
+backend_type: "cscs-dwdi-inference"
+
+backend_settings:
+  cscs_dwdi_api_url: "https://dwdi.cscs.ch"
+  cscs_dwdi_client_id: "your_oidc_client_id"
+  cscs_dwdi_client_secret: "your_oidc_client_secret"
+  cscs_dwdi_oidc_token_url: "https://auth.cscs.ch/realms/cscs/protocol/openid-connect/token"
+  cscs_dwdi_oidc_scope: "openid"  # Optional
+
+backend_components:
+  token_cost:
+    measured_unit: "EUR"
+    unit_factor: 1
+    accounting_type: "usage"
+    label: "Inference cost"
+```
+
+The warehouse returns a per-resource `totalCost`; the backend divides it by the `token_cost`
+component's `unit_factor` (or `unit_factor_reporting`) and reports the result. Because the amount is
+already priced by DWDI, set the offering plan's `token_cost` price to 1 so Waldur records the cost
+as-is.
 
 ## Authentication
 
@@ -258,6 +299,9 @@ waldur_site_load_historical_usage \
 | `--end-date` | End date in YYYY-MM-DD format |
 | `--no-staff-check` | Skip staff user validation (use with service provider tokens) |
 | `--skip-user-usage` | Only submit resource-level totals, skip per-user breakdown |
+| `--dry-run` | Log intended submissions without sending anything to Waldur |
+| `--reconcile-stale` | Zero out usage records absent from backend data (see below) |
+| `--resource-backend-id` | Process only the resource with this backend ID; repeatable |
 
 ### Notes
 
@@ -267,6 +311,58 @@ waldur_site_load_historical_usage \
   per-user usage submission, which can significantly speed up large loads
 - Resources must already exist in Waldur with valid `backend_id` values matching DWDI accounts
 - Maximum date range is 5 years
+- Backfilling `usage`-billing-type components into past billing periods is only permitted
+  for **staff** tokens; with a service provider token the Waldur API rejects such
+  submissions with an HTTP 400 mentioning "backfilling past billing periods"
+
+### Correcting Misreported Months
+
+If a past month holds wrong values (for example usage misattributed across a month
+boundary), the loader can rewrite that month from the authoritative backend data.
+A staff token is required, since usage-based components are being backfilled.
+
+Two flags exist specifically for corrections:
+
+- `--reconcile-stale` also *zeroes* records that the backend does not report:
+  resource totals for accounts with no backend data in that month, and per-user
+  usage rows for users missing from the backend report. Without it, phantom values
+  in Waldur survive whenever the backend has nothing to overwrite them with.
+- `--dry-run` prints every intended submission so the correction can be reviewed
+  before anything is written.
+
+Recommended sequence:
+
+```bash
+# 1. Review the correction for a single affected account first
+waldur_site_load_historical_usage \
+  --config /etc/waldur/cscs-dwdi-config.yaml \
+  --offering-uuid <offering-uuid> \
+  --user-token <staff-token> \
+  --start-date 2026-01-01 --end-date 2026-01-31 \
+  --resource-backend-id <account> \
+  --reconcile-stale --dry-run
+
+# 2. Apply it for that account
+waldur_site_load_historical_usage ... --resource-backend-id <account> --reconcile-stale
+
+# 3. Sweep the whole offering for the affected months (dry-run first, then apply)
+waldur_site_load_historical_usage \
+  --config /etc/waldur/cscs-dwdi-config.yaml \
+  --offering-uuid <offering-uuid> \
+  --user-token <staff-token> \
+  --start-date 2026-01-01 --end-date 2026-01-31 \
+  --reconcile-stale
+```
+
+Caveats:
+
+- Rewriting a past-period usage re-triggers marketplace billing for that record, but
+  the invoice item is only updated while the month's invoice is still mutable;
+  otherwise Waldur logs a warning and leaves the invoice untouched. Align with the
+  billing owner on which behaviour is expected before applying corrections.
+- Newly created past-month usage records are stored without a plan period, so they
+  do not generate retroactive invoice items — the correction is display/reporting
+  oriented by design.
 
 ## Example Configurations
 
@@ -339,6 +435,10 @@ This plugin is compatible with DWDI API version 1 (`/api/v1/`). It requires the 
 
 - `/api/v1/storage/usage-month/filesystem_name/data_type`
 - `/api/v1/storage/usage-day/filesystem_name/data_type`
+
+**Inference API:**
+
+- `/inference/resource/cost`
 
 ## Troubleshooting
 
@@ -438,6 +538,7 @@ plugins/cscs-dwdi/
 
 - **`CSCSDWDIComputeBackend`**: Compute usage reporting backend
 - **`CSCSDWDIStorageBackend`**: Storage usage reporting backend
+- **`CSCSDWDIInferenceBackend`**: Inference cost reporting backend
 - **`CSCSDWDIClient`**: HTTP client for CSCS-DWDI API communication with OIDC authentication
 
 ### Key Features

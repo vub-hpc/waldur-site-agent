@@ -15,11 +15,15 @@ automatically detected and loaded via Python entry points.
 
 import argparse
 import sys
+import threading
+import time
 import traceback
+from http import HTTPStatus
 from pathlib import Path
 from typing import Optional, Union, cast
 from uuid import UUID
 
+import httpx
 import yaml
 from httpx import TimeoutException
 from waldur_api_client import AuthenticatedClient
@@ -27,7 +31,10 @@ from waldur_api_client.api.marketplace_offering_users import (
     marketplace_offering_users_begin_creating,
     marketplace_offering_users_list,
     marketplace_offering_users_partial_update,
+    marketplace_offering_users_set_deleted,
+    marketplace_offering_users_set_deleting,
     marketplace_offering_users_set_error_creating,
+    marketplace_offering_users_set_error_deleting,
     marketplace_offering_users_set_pending_account_linking,
     marketplace_offering_users_set_pending_additional_validation,
     marketplace_offering_users_set_validation_complete,
@@ -41,6 +48,12 @@ from waldur_api_client.api.marketplace_provider_offerings import (
 from waldur_api_client.api.marketplace_provider_resources import (
     marketplace_provider_resources_set_as_erred,
     marketplace_provider_resources_set_limits,
+)
+from waldur_api_client.api.marketplace_resource_api_keys import (
+    marketplace_resource_api_keys_list,
+    marketplace_resource_api_keys_report_created,
+    marketplace_resource_api_keys_set_erred,
+    marketplace_resource_api_keys_set_key,
 )
 from waldur_api_client.api.marketplace_resources import marketplace_resources_list
 from waldur_api_client.api.users import users_me_retrieve
@@ -67,18 +80,27 @@ from waldur_api_client.models.offering_user_state_transition_request import (
 )
 from waldur_api_client.models.patched_offering_user_request import PatchedOfferingUserRequest
 from waldur_api_client.models.resource import Resource as WaldurResource
+from waldur_api_client.models.resource_api_key_report_created_request import (
+    ResourceApiKeyReportCreatedRequest,
+)
+from waldur_api_client.models.resource_api_key_set_erred_request import (
+    ResourceApiKeySetErredRequest,
+)
+from waldur_api_client.models.resource_api_key_set_key_request import (
+    ResourceApiKeySetKeyRequest,
+)
 from waldur_api_client.models.resource_set_limits_request_limits import (
     ResourceSetLimitsRequestLimits,
 )
 from waldur_api_client.models.update_offering_component_request import (
     UpdateOfferingComponentRequest,
 )
-from waldur_api_client.models.user import User
+from waldur_api_client.models.user_me import UserMe
 from waldur_api_client.models.username_generation_policy_enum import UsernameGenerationPolicyEnum
 from waldur_api_client.types import UNSET, Unset
 
 from waldur_site_agent.backend import (
-    BackendType,
+    DEFAULT_RESOURCE_KEY_COUNT,
     configure_logger,
     get_log_buffer_manager,
     get_log_shipping_manager,
@@ -87,6 +109,7 @@ from waldur_site_agent.backend import (
 )
 from waldur_site_agent.backend import exceptions as backend_exceptions
 from waldur_site_agent.backend.backends import (
+    DEPARTED_OFFERING_USER_STATES,
     AbstractUsernameManagementBackend,
     BaseBackend,
     UnknownBackend,
@@ -154,11 +177,9 @@ def log_versions(configuration: structures.WaldurAgentConfiguration) -> None:
 
     for offering in configuration.waldur_offerings:
         try:
-            client = get_client(
-                offering.api_url,
-                offering.api_token,
+            client = get_client_for_offering(
+                offering,
                 configuration.waldur_user_agent,
-                offering.verify_ssl,
                 configuration.global_proxy,
             )
             version_info = version_retrieve.sync(client=client)
@@ -192,12 +213,20 @@ def log_versions(configuration: structures.WaldurAgentConfiguration) -> None:
                     )
 
 
+# Long-running agent calls (paginated listings, bulk syncs) need a generous
+# timeout. Short-lived callers such as the readiness probe pass their own.
+DEFAULT_CLIENT_TIMEOUT = 600
+DEFAULT_OIDC_TIMEOUT = 30
+
+
 def get_client(
     api_url: str,
     access_token: str,
     agent_header: Optional[str] = None,
     verify_ssl: bool = True,
     proxy: Optional[str] = None,
+    token_prefix: str = "Token",  # noqa: S107
+    timeout: float = DEFAULT_CLIENT_TIMEOUT,
 ) -> AuthenticatedClient:
     """Create an authenticated Waldur API client.
 
@@ -207,12 +236,14 @@ def get_client(
         agent_header: Optional User-Agent string for HTTP requests
         verify_ssl: Whether or not to verify SSL certificates
         proxy: Optional proxy URL (e.g., 'socks5://localhost:12345')
+        token_prefix: Authorization header prefix ('Token' for static tokens, 'Bearer' for JWTs)
+        timeout: HTTP timeout in seconds for requests made with this client
 
     Returns:
         Configured AuthenticatedClient instance ready for API calls
     """
     headers = {"User-Agent": agent_header} if agent_header else {}
-    url = api_url.rstrip("/api")
+    url = api_url.rstrip("/").removesuffix("/api")
 
     # Configure httpx args with proxy if specified
     httpx_args = {}
@@ -222,10 +253,136 @@ def get_client(
     return AuthenticatedClient(
         base_url=url,
         token=access_token,
-        timeout=600,
+        prefix=token_prefix,
+        timeout=timeout,
         headers=headers,
         verify_ssl=verify_ssl,
         httpx_args=httpx_args,
+    )
+
+
+class OIDCAuthError(Exception):
+    """Raised when a JWT access token cannot be obtained from the OIDC provider."""
+
+
+# Cache of OIDC access tokens keyed by (token_url, client_id). Each entry is
+# (access_token, expiry_monotonic). Avoids hitting the provider on every client
+# construction (handlers/reconciliation build a client per message/iteration).
+_OIDC_TOKEN_CACHE: dict[tuple[str, str], tuple[str, float]] = {}
+_OIDC_TOKEN_CACHE_LOCK = threading.Lock()
+# Refresh a cached token this many seconds before it actually expires, so a
+# token handed out near the boundary does not expire mid-request.
+_OIDC_TOKEN_EXPIRY_MARGIN = 30
+# Fallback lifetime when the provider response omits expires_in.
+_OIDC_TOKEN_FALLBACK_TTL = 300
+
+
+def fetch_oidc_token(
+    oidc_token_url: str,
+    client_id: str,
+    client_secret: str,
+    verify_ssl: bool = True,
+    proxy: Optional[str] = None,
+    timeout: float = DEFAULT_OIDC_TIMEOUT,
+) -> str:
+    """Fetch (and cache) a JWT access token via the OIDC client_credentials grant.
+
+    Tokens are cached per (token_url, client_id) until shortly before they
+    expire (using the response's ``expires_in``), so repeated client
+    construction does not request a fresh token on every call.
+
+    Args:
+        oidc_token_url: Full URL of the OIDC token endpoint
+        client_id: OIDC client ID
+        client_secret: OIDC client secret
+        verify_ssl: Whether to verify the provider's TLS certificate
+        proxy: Optional proxy URL used to reach the provider
+        timeout: HTTP timeout in seconds for the token request
+
+    Returns:
+        Access token string from the OIDC provider response
+
+    Raises:
+        OIDCAuthError: if the provider response does not contain an access token
+    """
+    cache_key = (oidc_token_url, client_id)
+    with _OIDC_TOKEN_CACHE_LOCK:
+        cached = _OIDC_TOKEN_CACHE.get(cache_key)
+        if cached is not None:
+            token, expiry = cached
+            if time.monotonic() < expiry - _OIDC_TOKEN_EXPIRY_MARGIN:
+                return token
+
+    # Fetch outside the lock to avoid blocking other offerings during network I/O.
+    with httpx.Client(verify=verify_ssl, proxy=proxy, timeout=timeout) as client:
+        response = client.post(
+            oidc_token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+        )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("access_token")
+    if not token:
+        msg = f"OIDC provider at {oidc_token_url} did not return an access_token"
+        raise OIDCAuthError(msg)
+
+    expires_in = payload.get("expires_in")
+    try:
+        ttl = float(expires_in) if expires_in is not None else _OIDC_TOKEN_FALLBACK_TTL
+    except (TypeError, ValueError):
+        ttl = _OIDC_TOKEN_FALLBACK_TTL
+    with _OIDC_TOKEN_CACHE_LOCK:
+        _OIDC_TOKEN_CACHE[cache_key] = (token, time.monotonic() + ttl)
+    return token
+
+
+def get_client_for_offering(
+    offering: structures.Offering,
+    agent_header: Optional[str] = None,
+    proxy: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> AuthenticatedClient:
+    """Create an authenticated Waldur API client from an Offering configuration.
+
+    If waldur_api_token is set, uses it directly as a static token (``Token``
+    prefix). Otherwise obtains a JWT from the configured OIDC provider (``Bearer``
+    prefix), reusing a cached token until it nears expiry.
+
+    Args:
+        offering: Offering configuration containing API URL and auth settings
+        agent_header: Optional User-Agent string for HTTP requests
+        proxy: Optional proxy URL (e.g., 'socks5://localhost:12345')
+        timeout: HTTP timeout in seconds applied to both the OIDC token request
+            and the returned client. Defaults to the long agent timeouts.
+
+    Returns:
+        Configured AuthenticatedClient instance ready for API calls
+    """
+    if offering.waldur_api_token:
+        token = offering.waldur_api_token
+        token_prefix = "Token"  # noqa: S105
+    else:
+        token = fetch_oidc_token(
+            offering.oidc_token_url,  # type: ignore[arg-type]
+            offering.oidc_client_id,  # type: ignore[arg-type]
+            offering.oidc_client_secret,  # type: ignore[arg-type]
+            offering.verify_ssl,
+            proxy,
+            timeout=DEFAULT_OIDC_TIMEOUT if timeout is None else timeout,
+        )
+        token_prefix = "Bearer"  # noqa: S105
+    return get_client(
+        offering.waldur_api_url,
+        token,
+        agent_header,
+        offering.verify_ssl,
+        proxy,
+        token_prefix,
+        timeout=DEFAULT_CLIENT_TIMEOUT if timeout is None else timeout,
     )
 
 
@@ -309,7 +466,22 @@ def load_configuration(
         if configuration.sentry_dsn:
             import sentry_sdk  # noqa: PLC0415
 
-            sentry_sdk.init(dsn=configuration.sentry_dsn)
+            from .sentry import before_breadcrumb, before_send  # noqa: PLC0415
+
+            sentry_sdk.init(
+                dsn=configuration.sentry_dsn,
+                before_send=before_send,
+                before_breadcrumb=before_breadcrumb,
+                # An exception event carries every frame's locals, and the frames
+                # that mint an S3 key hold the secret as a bare string: croit's
+                # create_user_key takes it as an argument, and _request holds both
+                # the params dict and the signed URL. before_send is no defence --
+                # it never sees frame vars, and the query-parameter scrubber needs a
+                # name=value shape a lone secret does not have. The cost is losing
+                # locals on every event in the agent, which is the price of this
+                # being the error path of the code that handles credentials.
+                include_local_variables=False,
+            )
 
         # Handle Elastic APM configuration - initialize if server URL is provided
         if configuration.elastic_apm_server_url:
@@ -445,8 +617,9 @@ def get_backend_for_offering(
     backend_type = getattr(offering, backend_type_key, "")
     backend_info = BACKENDS.get(backend_type)
     if not backend_info:
-        logger.error("Unsupported backend type for %s: %s", backend_type_key, backend_type)
-        return UnknownBackend(), "unknown"
+        if backend_type:
+            logger.error("Unsupported backend type for %s: %s", backend_type_key, backend_type)
+        return UnknownBackend(backend_type), "unknown"
 
     backend_class, dist_name, dist_version = backend_info
 
@@ -459,6 +632,30 @@ def get_backend_for_offering(
     )
 
     return backend_class(offering.backend_settings, offering.backend_components_dict), dist_version
+
+
+def get_backend_class_for_offering(
+    offering: structures.Offering, backend_type_key: str = "order_processing_backend"
+) -> Optional[type[BaseBackend]]:
+    """Resolve the backend class for an offering without instantiating it.
+
+    Class-level capability flags can be read from the class alone. Constructing
+    a backend opens real clients (Kubernetes, Harbor, OpenNebula...) and raises
+    when its settings are incomplete, so callers that only need to inspect a
+    capability must not pay that cost for offerings they will skip.
+
+    Args:
+        offering: The offering configuration
+        backend_type_key: Key to determine which backend type to use
+
+    Returns:
+        The backend class, or None when the backend type is not registered.
+    """
+    backend_type = getattr(offering, backend_type_key, "")
+    backend_info = BACKENDS.get(backend_type)
+    if not backend_info:
+        return None
+    return backend_info[0]
 
 
 def get_offering_backend(
@@ -646,11 +843,8 @@ def _build_component_kwargs(component_info: dict) -> dict:
     return kwargs
 
 
-def _get_limit_period_enum(value: Union[
-    BlankEnum,
-    LimitPeriodEnum,
-    None,
-    Unset]
+def _get_limit_period_enum(
+    value: Union[BlankEnum, LimitPeriodEnum, None, Unset],
 ) -> Optional[LimitPeriodEnum]:
     """Convert API/client limit period values to LimitPeriodEnum when set."""
     if value is UNSET or value is None:
@@ -701,9 +895,7 @@ def load_components_to_waldur(
             if component_type in waldur_offering_components:
                 existing_component = waldur_offering_components[component_type]
                 if "limit_period" not in extra_kwargs:
-                    existing_limit_period = _get_limit_period_enum(
-                        existing_component.limit_period
-                    )
+                    existing_limit_period = _get_limit_period_enum(existing_component.limit_period)
                     if existing_limit_period is not None:
                         extra_kwargs["limit_period"] = existing_limit_period
                 logger.info(
@@ -756,14 +948,14 @@ def load_components_to_waldur(
             logger.exception(e)
 
 
-def get_current_user_from_client(waldur_rest_client: AuthenticatedClient) -> User:
+def get_current_user_from_client(waldur_rest_client: AuthenticatedClient) -> UserMe:
     """Retrieve current authenticated user information from Waldur.
 
     Args:
         waldur_rest_client: Authenticated Waldur API client
 
     Returns:
-        User object containing current user details and permissions
+        UserMe object containing current user details and permissions
     """
     return users_me_retrieve.sync(client=waldur_rest_client)
 
@@ -930,50 +1122,67 @@ def create_homedirs_for_offering_users() -> None:
     """Create home directories for all offering users.
 
     This utility function creates home directories for users associated
-    with offerings that have home directory creation enabled. Currently
-    supports SLURM backends with configurable umask settings.
+    with offerings that have home directory creation enabled. Any backend
+    declaring ``supports_user_homedirs`` participates; the per-offering
+    ``enable_user_homedir_account_creation`` setting can still opt out.
     """
     configuration = init_configuration()
     for offering in configuration.waldur_offerings:
-        # Feature is exclusive for SLURM temporarily
-        if offering.backend_type != BackendType.SLURM.value or not offering.backend_settings.get(
-            "enable_user_homedir_account_creation", True
-        ):
+        if not offering.backend_settings.get("enable_user_homedir_account_creation", True):
+            continue
+
+        # Read the capability off the class. Instantiating every offering's
+        # backend just to skip it would open unrelated clients and let one
+        # misconfigured offering abort homedir creation for all the others.
+        backend_class = get_backend_class_for_offering(offering, "order_processing_backend")
+
+        if backend_class is None or not backend_class.supports_user_homedirs:
+            logger.info(
+                "Backend %s of offering %s does not support homedir creation, skipping",
+                offering.backend_type,
+                offering.name,
+            )
             continue
 
         logger.info("Creating homedirs for %s offering users", offering.name)
 
-        waldur_rest_client = get_client(
-            offering.api_url,
-            offering.api_token,
-            configuration.waldur_user_agent,
-            offering.verify_ssl,
-            configuration.global_proxy,
-        )
-        offering_users = marketplace_offering_users_list.sync_all(
-            client=waldur_rest_client,
-            offering_uuid=[offering.uuid],
-            state=[OfferingUserState.OK],
-            is_restricted=False,
-            field=[OfferingUserFieldEnum.USERNAME],
-        )
+        # One offering's unreachable backend or API must not cost the remaining
+        # offerings their homedirs — this command sweeps all of them in one run.
+        try:
+            waldur_rest_client = get_client(
+                offering.api_url,
+                offering.api_token,
+                configuration.waldur_user_agent,
+                offering.verify_ssl,
+                configuration.global_proxy,
+            )
+            offering_users = marketplace_offering_users_list.sync_all(
+                client=waldur_rest_client,
+                offering_uuid=[offering.uuid],
+                state=[OfferingUserState.OK],
+                is_restricted=False,
+                field=[OfferingUserFieldEnum.USERNAME],
+            )
 
-        offering_user_usernames: set[str] = {
-            offering_user.username for offering_user in offering_users
-        }
-        umask = offering.backend_settings.get("default_homedir_umask", "0077")
-        offering_backend, _ = get_backend_for_offering(offering, "order_processing_backend")
-        offering_backend.create_user_homedirs(offering_user_usernames, umask)
+            offering_user_usernames: set[str] = {
+                offering_user.username for offering_user in offering_users
+            }
+            umask = offering.backend_settings.get("default_homedir_umask", "0077")
+            offering_backend, _ = get_backend_for_offering(offering, "order_processing_backend")
+            offering_backend.create_user_homedirs(offering_user_usernames, umask)
+        except Exception:
+            logger.exception("Failed to create homedirs for offering %s", offering.name)
+            continue
 
 
-def print_current_user(current_user: User) -> None:
+def print_current_user(current_user: UserMe) -> None:
     """Log detailed information about a Waldur user.
 
     Displays user details including username, full name, staff status,
     and all associated permissions with their scopes and expiration times.
 
     Args:
-        current_user: User object to display information for
+        current_user: UserMe object to display information for
     """
     logger.info("Current user username: %s", current_user.username)
     logger.info("Current user full name: %s", current_user.full_name)
@@ -984,7 +1193,6 @@ def print_current_user(current_user: User) -> None:
         logger.info("List of permissions:")
         for permission in current_user.permissions:
             logger.info("Role name: %s", permission.role_name)
-            logger.info("Role description: %s", permission.role_description)
             logger.info("Scope type: %s", permission.scope_type)
             logger.info("Scope name: %s", permission.scope_name)
             logger.info("Scope UUID: %s", permission.scope_uuid)
@@ -1043,6 +1251,153 @@ def get_username_management_backend(
     )
 
 
+#: What a username backend's ``release_users`` needs about each offering user:
+#: enough to name the account, to tell what Waldur thinks of it, and to look
+#: for the same person's other accounts on the same provider.
+RELEASE_OFFERING_USER_FIELDS: list[OfferingUserFieldEnum] = [
+    OfferingUserFieldEnum.UUID,
+    OfferingUserFieldEnum.USERNAME,
+    OfferingUserFieldEnum.USER_UUID,
+    OfferingUserFieldEnum.USER_USERNAME,
+    OfferingUserFieldEnum.USER_EMAIL,
+    OfferingUserFieldEnum.STATE,
+    OfferingUserFieldEnum.IS_RESTRICTED,
+    OfferingUserFieldEnum.OFFERING_UUID,
+    OfferingUserFieldEnum.OFFERING_NAME,
+    OfferingUserFieldEnum.CUSTOMER_UUID,
+]
+
+
+def get_release_capable_username_backend(
+    offering: structures.Offering,
+) -> Optional[AbstractUsernameManagementBackend]:
+    """The offering's username backend, if it implements ``release_users``.
+
+    The default on the abstract base is a no-op, so for a backend that leaves it
+    alone there is nothing to fetch and nothing to call; callers skip the Waldur
+    round-trips on ``None``.
+    """
+    try:
+        backend, _ = get_username_management_backend(offering)
+    except Exception:
+        logger.exception(
+            "Could not resolve the username management backend for %s", offering.name
+        )
+        return None
+    if type(backend).release_users is AbstractUsernameManagementBackend.release_users:
+        return None
+    return backend
+
+
+def _check_transition(response: object, target: str) -> None:
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and status_code >= HTTPStatus.BAD_REQUEST:
+        msg = f"Transition to {target} rejected with HTTP {status_code}"
+        raise BackendError(msg)
+
+
+def claim_offering_user_deletion(
+    offering_user: OfferingUser, waldur_rest_client: AuthenticatedClient
+) -> bool:
+    """Move the offering user to DELETING *before* touching the provider side.
+
+    This is the compare-and-swap that protects a person who was restored in the
+    meantime: Waldur's transition validator refuses ``set_deleting`` for a row
+    that is live again (only REQUESTED_DELETION / ERROR_DELETING may become
+    DELETING), so a refusal here means "do not tear this account down" rather
+    than an error. Returns whether the claim holds; a row already in DELETING
+    is ours from an earlier, interrupted attempt.
+    """
+    state = getattr(offering_user, "state", UNSET)
+    if state == OfferingUserState.DELETING:
+        return True
+    if state not in DEPARTED_OFFERING_USER_STATES:
+        return False
+    response = marketplace_offering_users_set_deleting.sync_detailed(
+        uuid=offering_user.uuid, client=waldur_rest_client
+    )
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and status_code >= HTTPStatus.BAD_REQUEST:
+        logger.info(
+            "Waldur refused to move offering user %s (%s) to DELETING (HTTP %s); it was "
+            "restored in the meantime, leaving the account alone",
+            offering_user.username,
+            offering_user.uuid,
+            status_code,
+        )
+        return False
+    return True
+
+
+def complete_offering_user_deletion(
+    offering_user: OfferingUser, waldur_rest_client: AuthenticatedClient
+) -> None:
+    """Mark a claimed (DELETING) offering user DELETED.
+
+    Only DELETING may become DELETED. This is what lets Waldur release the
+    provider-wide identity behind the account, so it runs only once the
+    provider side is torn down.
+    """
+    _check_transition(
+        marketplace_offering_users_set_deleted.sync_detailed(
+            uuid=offering_user.uuid, client=waldur_rest_client
+        ),
+        "DELETED",
+    )
+    logger.info(
+        "Marked offering user %s (%s) DELETED in Waldur", offering_user.username, offering_user.uuid
+    )
+
+
+def mark_offering_user_error_deleting(
+    offering_user: OfferingUser, waldur_rest_client: AuthenticatedClient
+) -> None:
+    """Best-effort: make a failed teardown visible in Waldur; the sweep retries it."""
+    state = getattr(offering_user, "state", UNSET)
+    if state not in (OfferingUserState.REQUESTED_DELETION, OfferingUserState.DELETING):
+        return
+    try:
+        _check_transition(
+            marketplace_offering_users_set_error_deleting.sync_detailed(
+                uuid=offering_user.uuid, client=waldur_rest_client
+            ),
+            "ERROR_DELETING",
+        )
+    except Exception:
+        logger.exception(
+            "Could not mark offering user %s (%s) as error deleting",
+            offering_user.username,
+            offering_user.uuid,
+        )
+
+
+def release_offering_users(
+    backend: AbstractUsernameManagementBackend,
+    offering: structures.Offering,
+    offering_users: list[OfferingUser],
+    waldur_rest_client: AuthenticatedClient,
+) -> None:
+    """Hand departed offering users to the username backend, never raising.
+
+    A failure here must not abort the membership cycle that triggered it: the
+    associations are already gone, and the backend gets the same accounts again
+    on the next cycle for as long as Waldur keeps them in a deletion state.
+    """
+    if not offering_users:
+        return
+    logger.info(
+        "Releasing %d departed offering user(s) of %s through the %s backend: %s",
+        len(offering_users),
+        offering.name,
+        offering.username_management_backend,
+        ", ".join(sorted(ou.username for ou in offering_users if ou.username)),
+    )
+    try:
+        backend.release_users(offering_users, waldur_rest_client)
+    except Exception:
+        logger.exception("Failed to release departed offering users of %s", offering.name)
+
+
 def update_offering_users(
     offering: structures.Offering,
     waldur_rest_client: AuthenticatedClient,
@@ -1073,6 +1428,24 @@ def update_offering_users(
     # Skip processing if we have an unknown username management backend
     if isinstance(username_management_backend, UnknownUsernameManagementBackend):
         logger.debug("Skipping username processing - unknown username management backend")
+        return False
+
+    # The backend does not own the login name — Waldur does. Never ask it to mint
+    # one, and never PATCH a name back over the authoritative value. Checked here
+    # rather than in _update_user_username so that both call sites are covered by
+    # one log line instead of one per user. Reaching this branch means the offering
+    # is misconfigured: _can_generate_usernames above returns False for every
+    # policy other than 'service_provider', so a correct setup never gets here.
+    if not username_management_backend.is_username_authoritative:
+        logger.error(
+            "Offering %s (%s) uses the '%s' username management backend, for which "
+            "Waldur is the source of truth, but its username_generation_policy is "
+            "'service_provider'. Skipping username generation - change the policy "
+            "in Waldur, or point the offering at a backend that assigns names.",
+            offering.name,
+            offering.uuid,
+            offering.username_management_backend,
+        )
         return False
 
     # Group users by their current state for efficient processing
@@ -1109,10 +1482,7 @@ def _can_generate_usernames(
     # The agent only generates usernames under the service_provider policy.
     # Other policies are handled by Waldur Mastermind, so the
     # service_provider_can_create_offering_user flag is irrelevant there.
-    if (
-        plugin_options.username_generation_policy
-        != UsernameGenerationPolicyEnum.SERVICE_PROVIDER
-    ):
+    if plugin_options.username_generation_policy != UsernameGenerationPolicyEnum.SERVICE_PROVIDER:
         return False
 
     # Check if service provider is allowed to create offering users
@@ -1446,7 +1816,7 @@ def sync_resource_limits() -> None:
         logger.info("Processing limits for %s resource(s)", len(waldur_resources))
         for waldur_resource in waldur_resources:
             try:
-                sync_waldur_resource_limits(backend, waldur_rest_client, waldur_resource)
+                backend.sync_resource_limits(waldur_resource, waldur_rest_client)
             except (BackendError, UnexpectedStatus, TimeoutException) as e:
                 logger.error(
                     "Failed to sync resource limits for %s, reason: %s", waldur_resource.name, e
@@ -1563,3 +1933,162 @@ def get_all_paginated(api_function, client, **kwargs) -> list:  # noqa: ANN001, 
         page += 1
 
     return all_items
+
+
+def provision_resource_api_keys(
+    waldur_rest_client: AuthenticatedClient,
+    resource_uuid: str,
+    resource_backend_id: str,
+    backend,  # noqa: ANN001 - BaseBackend would be a circular import
+    count: Optional[int] = None,
+) -> None:
+    """Generate keys in the backend and report each to Waldur (encrypted).
+
+    The agent owns generation: it applies each key to the backend first, then
+    pushes the value so Waldur only ever stores a live key.
+    """
+    # Provisioning is also the path an interrupted create comes back through: the
+    # user survives with whatever keys the earlier attempt applied, and adopting it
+    # would carry them into a live resource with no row in Waldur to rotate them by.
+    # Cleared before minting, so the fresh pairs are never candidates for it.
+    known_client_ids = _known_client_ids(waldur_rest_client, resource_uuid)
+    if known_client_ids is not None:
+        try:
+            backend.prune_unknown_resource_keys(resource_backend_id, known_client_ids)
+        except Exception as exc:
+            # Clearing residue is hygiene; minting is what this function is for. The
+            # caller swallows everything raised here, so letting a prune failure
+            # through ends with a provisioned resource holding no keys and an order
+            # marked done -- and there is no add command to recover with.
+            logger.warning(
+                "Could not clear the stale keys of resource %s, minting anyway: %s",
+                resource_uuid,
+                exc,
+            )
+
+    # The count is a target for the resource, not an amount to add. The prune above
+    # keeps every key Waldur already holds, so minting a full set on top of one
+    # would leave a re-processed create order with four live keys against a cap of
+    # two. An unknown set (None) still mints the full count: it cannot be told apart
+    # from "Waldur holds none", and there is no add command to make up a shortfall.
+    target = DEFAULT_RESOURCE_KEY_COUNT if count is None else count
+    missing = max(0, target - len(known_client_ids or []))
+
+    for key in backend.generate_resource_keys(resource_backend_id, count=missing):
+        marketplace_resource_api_keys_report_created.sync(
+            client=waldur_rest_client,
+            body=ResourceApiKeyReportCreatedRequest(
+                resource=resource_uuid,
+                client_id=key["client_id"],
+                api_key=key["api_key"],
+            ),
+        )
+
+
+def _known_client_ids(
+    waldur_rest_client: AuthenticatedClient, resource_uuid: str
+) -> Optional[list[str]]:
+    """List every client_id Waldur holds for a resource, or None if it cannot.
+
+    Feeds the backend's orphan pruning. None means "unknown", which the backends
+    treat as "prune nothing" — a listing failure must not be read as "Waldur holds
+    no keys" and take out every credential the resource has.
+    """
+    try:
+        keys = marketplace_resource_api_keys_list.sync_all(
+            client=waldur_rest_client, resource_uuid=resource_uuid
+        )
+    except Exception as exc:
+        logger.warning("Could not list the API keys of resource %s: %s", resource_uuid, exc)
+        return None
+
+    client_ids = [key.client_id for key in keys if key.client_id]
+    if len(client_ids) != len(keys):
+        # A row whose client_id has not landed yet is still a key Waldur holds.
+        # Dropping it presents the set as complete when it is not, and the backends
+        # prune everything outside what they are given.
+        logger.warning(
+            "Resource %s has %d API key row(s) with no client_id; treating the "
+            "known set as unknown so nothing is pruned",
+            resource_uuid,
+            len(keys) - len(client_ids),
+        )
+        return None
+    # An empty listing is not proof that the resource has no keys — a filter
+    # mismatch or a scoping change produces the same 200. Only a complete,
+    # non-empty listing is safe to prune against.
+    return client_ids or None
+
+
+def _set_key_body(result: Union[str, dict]) -> ResourceApiKeySetKeyRequest:
+    """Build the report body from whichever shape the backend returned.
+
+    A backend whose public identifier rotates with the secret (an S3 access key)
+    returns both halves; one with a stable client_id (an Envoy Secret slot) returns
+    just the secret. Anything else is a plugin bug, and raising here puts it on the
+    error path rather than letting a malformed body reach Waldur.
+    """
+    if isinstance(result, dict):
+        missing = sorted({"api_key", "client_id"} - set(result))
+        if missing:
+            msg = f"rotate_resource_key returned a dict missing {missing}"
+            raise ValueError(msg)
+        return ResourceApiKeySetKeyRequest(
+            api_key=result["api_key"], client_id=result["client_id"]
+        )
+    if not isinstance(result, str) or not result:
+        msg = (
+            "rotate_resource_key returned "
+            f"{type(result).__name__}, expected a non-empty str or a dict"
+        )
+        raise ValueError(msg)
+    return ResourceApiKeySetKeyRequest(api_key=result)
+
+
+def rotate_resource_api_key(
+    waldur_rest_client: AuthenticatedClient,
+    api_key_uuid: str,
+    client_id: str,
+    backend,  # noqa: ANN001
+    resource_backend_id: str,
+    resource_uuid: Optional[str] = None,
+    expose_backend_error_details: bool = True,
+) -> None:
+    """Rotate one key in the backend, then report the new value to Waldur.
+
+    A backend whose public identifier rotates together with the secret (an S3
+    access key) returns both halves as a dict; one with a stable client_id (an
+    Envoy Secret slot) returns just the new secret.
+
+    When ``resource_uuid`` is given, the resource's known client_ids travel with the
+    rotation so a backend can drop keys Waldur never learned about — the residue of
+    an earlier rotation whose reply was lost.
+    """
+    known = (
+        _known_client_ids(waldur_rest_client, resource_uuid)
+        if resource_uuid is not None
+        else None
+    )
+    try:
+        result = backend.rotate_resource_key(
+            client_id, resource_backend_id, known_client_ids=known
+        )
+        # The report is inside the try on purpose. Outside it, a failed set_key left
+        # the row Updating with modified unadvanced, which is exactly what the
+        # reconciliation sweep selects — so every tick re-minted a live key and threw
+        # the previous one away. Mastermind refuses set_erred from OK, so a late erred
+        # after a set_key that did land is rejected rather than flipping a healthy key.
+        marketplace_resource_api_keys_set_key.sync(
+            uuid=api_key_uuid,
+            client=waldur_rest_client,
+            body=_set_key_body(result),
+        )
+    except Exception as exc:
+        logger.error("Failed to rotate API key %s: %s", client_id, exc)
+        error_message, _ = format_waldur_error_details(exc, expose_backend_error_details)
+        marketplace_resource_api_keys_set_erred.sync(
+            uuid=api_key_uuid,
+            client=waldur_rest_client,
+            body=ResourceApiKeySetErredRequest(error_message=error_message),
+        )
+        return

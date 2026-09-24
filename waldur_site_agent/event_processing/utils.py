@@ -8,21 +8,34 @@ import sys
 import types
 from collections.abc import Generator
 from contextlib import contextmanager
+from typing import Callable, Optional
 
 from waldur_api_client import AuthenticatedClient
 from waldur_api_client.api.marketplace_offering_users import marketplace_offering_users_list
 from waldur_api_client.api.marketplace_orders import marketplace_orders_list
+from waldur_api_client.api.marketplace_resource_api_keys import (
+    marketplace_resource_api_keys_list,
+)
 from waldur_api_client.models.observable_object_type_enum import ObservableObjectTypeEnum
 from waldur_api_client.models.offering_user_state import OfferingUserState
 from waldur_api_client.models.order_state import OrderState
+from waldur_api_client.models.resource_api_key_state import ResourceApiKeyState
 
 from waldur_site_agent.backend import logger
+from waldur_site_agent.backend.backends import (
+    DEPARTED_OFFERING_USER_STATES,
+    AbstractUsernameManagementBackend,
+)
 from waldur_site_agent.common import agent_identity_management
 from waldur_site_agent.common import processors as common_processors
 from waldur_site_agent.common import structures as common_structures
 from waldur_site_agent.common import utils as common_utils
 from waldur_site_agent.common.healthz import touch_heartbeat
-from waldur_site_agent.common.utils import get_backend_for_offering, get_client
+from waldur_site_agent.common.utils import (
+    get_backend_for_offering,
+    get_client_for_offering,
+)
+from waldur_site_agent.event_processing import handlers
 from waldur_site_agent.event_processing.event_subscription_manager import EventSubscriptionManager
 from waldur_site_agent.event_processing.structures import (
     StompConsumer,
@@ -45,13 +58,19 @@ def _determine_observable_object_types(
 
     if offering.order_processing_backend:
         object_types.append(ObservableObjectTypeEnum.ORDER)
+        # Rotation is an order-processing-backend capability; the handler no-ops for
+        # backends that leave supports_resource_api_keys False.
+        object_types.append(ObservableObjectTypeEnum.RESOURCE_API_KEY_ROTATION)
     else:
         logger.info(
             "Order processing is disabled for offering %s, skipping start of STOMP connections",
             offering.name,
         )
 
-    if offering.membership_sync_backend:
+    # stomp_membership_sync_enabled=None inherits stomp_enabled (True here);
+    # False opts out of STOMP membership so the polling agent handles it instead.
+    stomp_membership = offering.stomp_membership_sync_enabled is not False
+    if offering.membership_sync_backend and stomp_membership:
         object_types.extend(
             [
                 ObservableObjectTypeEnum.USER_ROLE,
@@ -122,78 +141,68 @@ def _register_agent_identity(
         return None
 
 
-def _setup_single_stomp_subscription(
+def _setup_unified_stomp_connection(
     offering: common_structures.Offering,
     agent_identity: agent_identity_management.AgentIdentity,
     agent_identity_manager: agent_identity_management.AgentIdentityManager,
     waldur_user_agent: str,
-    object_type: ObservableObjectTypeEnum,
+    object_types: list[ObservableObjectTypeEnum],
     global_proxy: str = "",
     expose_backend_error_details: bool = True,
+    on_message_callback: Optional[Callable] = None,
 ) -> StompConsumer | None:
-    """Setup a single STOMP subscription for the given object type.
+    """Register the single unified consumer queue and open ONE STOMP connection.
+
+    Replaces the legacy per-object-type setup: one register_queue call binds all
+    requested object types to a single ``consumer_{uuid}`` queue, and one STOMP
+    connection drains it with payload-based routing (see route_message).
 
     Args:
-        offering: The Waldur offering configuration
-        agent_identity: The registered agent identity
-        agent_identity_manager: Manager for agent identity operations
-        waldur_user_agent: User agent string
-        object_type: Type of observable object to subscribe to
-        global_proxy: Optional proxy configuration
-        expose_backend_error_details: Whether to forward raw exception details to Waldur
+        offering: The Waldur offering configuration.
+        agent_identity: The registered agent identity.
+        agent_identity_manager: Manager for agent identity operations.
+        waldur_user_agent: User agent string.
+        object_types: Observable object types the queue should receive.
+        global_proxy: Optional proxy configuration.
+        expose_backend_error_details: Whether to forward raw exception details.
+        on_message_callback: Optional custom router (used by the federation target
+            path to dispatch the unified queue to per-type target handlers).
+            Defaults to the standard payload router.
 
     Returns:
-        Tuple of (connection, event_subscription, offering) if successful, None if failed
+        Tuple of (connection, unified_queue, offering) if successful, else None.
     """
     try:
-        event_subscription = agent_identity_manager.register_event_subscription(
-            agent_identity, object_type
-        )
-
-        event_subscription_queue = agent_identity_manager.create_event_subscription_queue(
-            event_subscription, object_type
-        )
-        if event_subscription_queue is None:
-            logger.error(
-                "Failed to create event subscription queue for the offering %s, object type %s",
-                offering.name,
-                object_type,
-            )
-            return None
+        unified_queue = agent_identity_manager.register_queue(agent_identity, object_types)
 
         event_subscription_manager = EventSubscriptionManager(
             offering,
             None,
-            None,
+            on_message_callback,
             waldur_user_agent,
-            object_type,
             global_proxy,
             expose_backend_error_details=expose_backend_error_details,
         )
         connection = event_subscription_manager.setup_stomp_connection(
-            event_subscription,
+            unified_queue,
             offering.stomp_ws_host,
             offering.stomp_ws_port,
             offering.stomp_ws_path,
         )
-        connected = event_subscription_manager.start_stomp_connection(
-            event_subscription, connection
-        )
+        connected = event_subscription_manager.start_stomp_connection(unified_queue, connection)
         if not connected:
             logger.error(
-                "Failed to start STOMP connection for the offering %s (%s), object type %s",
+                "Failed to start unified STOMP connection for the offering %s (%s)",
                 offering.name,
                 offering.uuid,
-                object_type,
             )
             return None
 
-        return (connection, event_subscription, offering)
+        return (connection, unified_queue, offering)
     except Exception as e:
         logger.exception(
-            "Unable to register event subscription for offering %s object type %s: %s",
+            "Unable to register unified event queue for offering %s: %s",
             offering.name,
-            object_type,
             e,
         )
         return None
@@ -210,14 +219,17 @@ def setup_stomp_offering_subscriptions(
 
     # Determine which object types to subscribe to
     object_types = _determine_observable_object_types(waldur_offering)
+    if not object_types:
+        # No event-driven features enabled: nothing to subscribe to. Do NOT
+        # register a queue with an empty type list — the backend reads an empty
+        # list as "all types", which is not what an idle offering wants.
+        logger.info(
+            "No observable object types for offering %s; skipping STOMP setup",
+            waldur_offering.name,
+        )
+        return stomp_connections
 
-    waldur_rest_client = get_client(
-        waldur_offering.api_url,
-        waldur_offering.api_token,
-        waldur_user_agent,
-        verify_ssl=waldur_offering.verify_ssl,
-        proxy=global_proxy,
-    )
+    waldur_rest_client = get_client_for_offering(waldur_offering, waldur_user_agent, global_proxy)
 
     # Register agent identity
     result = _register_agent_identity(waldur_offering, waldur_rest_client)
@@ -226,28 +238,25 @@ def setup_stomp_offering_subscriptions(
 
     agent_identity, agent_identity_manager = result
 
-    # Setup subscription for each object type
-    for object_type in object_types:
-        consumer = _setup_single_stomp_subscription(
-            waldur_offering,
-            agent_identity,
-            agent_identity_manager,
-            waldur_user_agent,
-            object_type,
-            global_proxy,
-            expose_backend_error_details=expose_backend_error_details,
-        )
-        if consumer is not None:
-            stomp_connections.append(consumer)
+    # One unified queue + one STOMP connection for ALL object types.
+    consumer = _setup_unified_stomp_connection(
+        waldur_offering,
+        agent_identity,
+        agent_identity_manager,
+        waldur_user_agent,
+        object_types,
+        global_proxy,
+        expose_backend_error_details=expose_backend_error_details,
+    )
+    if consumer is not None:
+        stomp_connections.append(consumer)
 
     # Set up target event subscriptions for backends that support them
     # (e.g., Waldur federation backend subscribes to ORDER events on Waldur B).
     # BaseBackend.setup_target_event_subscriptions returns [] by default.
     if waldur_offering.order_processing_backend:
         try:
-            backend, _ = get_backend_for_offering(
-                waldur_offering, "order_processing_backend"
-            )
+            backend, _ = get_backend_for_offering(waldur_offering, "order_processing_backend")
             target_consumers = backend.setup_target_event_subscriptions(
                 waldur_offering, waldur_user_agent, global_proxy
             )
@@ -259,7 +268,6 @@ def setup_stomp_offering_subscriptions(
             )
 
     return stomp_connections
-
 
 
 def start_stomp_consumers(
@@ -296,7 +304,7 @@ def stop_stomp_consumers(
         logger.info("Stopping STOMP connections for %s (%s)", offering_name, offering_uuid)
         for (
             connection,
-            event_subscription,
+            unified_queue,
             offering,
         ) in consumers:
             try:
@@ -304,12 +312,10 @@ def stop_stomp_consumers(
                     offering,
                 )
                 logger.info(
-                    "Stopping STOMP connection for %s (%s), observable object type: %s",
+                    "Stopping unified STOMP connection for %s (%s), queue: %s",
                     offering_name,
                     offering_uuid,
-                    event_subscription.observable_objects[0].object_type
-                    if event_subscription.observable_objects
-                    else "N/A",
+                    unified_queue.queue_name,
                 )
                 event_subscription_manager.stop_stomp_connection(connection)
             except Exception as exc:
@@ -375,17 +381,12 @@ def process_offering(
     """Processes the specified offering."""
     logger.info("Processing offering %s (%s)", offering.name, offering.uuid)
 
-    waldur_rest_client = get_client(
-        offering.api_url, offering.api_token, user_agent, verify_ssl=offering.verify_ssl
-    )
-    agent_identity_manager = agent_identity_management.AgentIdentityManager(
-        offering, waldur_rest_client
-    )
-    agent_identity = agent_identity_manager.register_identity(f"agent-{offering.uuid}")
-    agent_service = agent_identity_manager.register_service(
-        agent_identity,
-        "initial-offering-process",
+    waldur_rest_client = get_client_for_offering(offering, user_agent)
+    agent_service = agent_identity_management.ensure_agent_telemetry(
+        offering,
+        waldur_rest_client,
         common_structures.AgentMode.EVENT_PROCESS.value,
+        service_name="initial-offering-process",
     )
 
     if offering.order_processing_backend:
@@ -400,7 +401,7 @@ def process_offering(
     else:
         logger.info("Order processing is disabled for this offering, skipping it")
 
-    if offering.membership_sync_backend:
+    if offering.membership_sync_backend and offering.stomp_membership_sync_enabled is not False:
         membership_processor = common_processors.OfferingMembershipProcessor(
             offering,
             waldur_rest_client,
@@ -427,15 +428,8 @@ def run_periodic_username_reconciliation(
         if not offering.username_reconciliation_enabled:
             continue
         try:
-            waldur_rest_client = get_client(
-                offering.api_url,
-                offering.api_token,
-                user_agent,
-                verify_ssl=offering.verify_ssl,
-            )
-            resource_backend, _ = get_backend_for_offering(
-                offering, "membership_sync_backend"
-            )
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
+            resource_backend, _ = get_backend_for_offering(offering, "membership_sync_backend")
             updated = resource_backend.sync_offering_user_usernames(
                 offering.uuid, waldur_rest_client
             )
@@ -445,9 +439,7 @@ def run_periodic_username_reconciliation(
                     offering.name,
                 )
         except Exception:
-            logger.exception(
-                "Reconciliation failed for offering %s", offering.name
-            )
+            logger.exception("Reconciliation failed for offering %s", offering.name)
 
 
 def run_periodic_offering_user_reconciliation(
@@ -466,14 +458,12 @@ def run_periodic_offering_user_reconciliation(
     for offering in waldur_offerings:
         touch_heartbeat()
         if not offering.membership_sync_backend:
+            # No usernames to mint here, but the username backend's own
+            # reconcile and the deletion sweep still apply.
+            _run_username_backend_reconciliation(offering, user_agent)
             continue
         try:
-            waldur_rest_client = get_client(
-                offering.api_url,
-                offering.api_token,
-                user_agent,
-                verify_ssl=offering.verify_ssl,
-            )
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
 
             stuck_users = marketplace_offering_users_list.sync_all(
                 client=waldur_rest_client,
@@ -497,18 +487,78 @@ def run_periodic_offering_user_reconciliation(
                 offering.name,
             )
 
-            updated = common_utils.update_offering_users(
-                offering, waldur_rest_client, stuck_users
-            )
+            updated = common_utils.update_offering_users(offering, waldur_rest_client, stuck_users)
             if updated:
                 logger.info(
                     "Offering user reconciliation: usernames updated for %s",
                     offering.name,
                 )
         except Exception:
-            logger.exception(
-                "Offering user reconciliation failed for %s", offering.name
-            )
+            logger.exception("Offering user reconciliation failed for %s", offering.name)
+
+        _run_username_backend_reconciliation(offering, user_agent)
+
+
+def _run_username_backend_reconciliation(
+    offering: common_structures.Offering, user_agent: str = ""
+) -> None:
+    """Hand the offering's full user list to the username backend's reconcile hook.
+
+    The loop above only looks at accounts stuck in a pre-OK state, because that is
+    all username *generation* can help with. A backend for which Waldur is the
+    source of truth has the opposite problem: its work is on the accounts already
+    in OK, and it needs to notice a directory entry that was deleted or edited out
+    of band. Nothing else covers that on a STOMP offering — polling membership sync
+    skips them entirely.
+
+    The same pass hands the accounts Waldur has flagged for deletion to the
+    backend's release hook: on a STOMP offering the role-change event usually
+    arrives before Waldur's deletion request does, so the removal-time hook in
+    the membership processor sees an account that still looks live and leaves
+    it. This sweep is what eventually lets it go.
+
+    Backends that leave both sync_user_profiles and release_users as the
+    inherited no-ops pay nothing: the identity checks below short-circuit
+    before any request is made.
+    """
+    try:
+        backend, _ = common_utils.get_username_management_backend(offering)
+    except Exception:
+        logger.exception(
+            "Could not resolve the username management backend for %s", offering.name
+        )
+        return
+
+    syncs_profiles = (
+        type(backend).sync_user_profiles
+        is not AbstractUsernameManagementBackend.sync_user_profiles
+    )
+
+    try:
+        waldur_rest_client = get_client_for_offering(offering, user_agent)
+        # No `field=` filter: the reconciler needs the POSIX attributes.
+        offering_users = marketplace_offering_users_list.sync_all(
+            client=waldur_rest_client,
+            offering_uuid=[offering.uuid],
+            is_restricted=False,
+        )
+        if offering_users and syncs_profiles:
+            backend.sync_user_profiles(offering_users)
+        # The teardown runs for every offering: associations and the
+        # acknowledgement need no username backend at all. Its own query, by
+        # state and without the restricted filter above: a restricted user whose
+        # deletion was requested while the agent was disconnected must still go.
+        departed = marketplace_offering_users_list.sync_all(
+            client=waldur_rest_client,
+            offering_uuid=[offering.uuid],
+            state=list(DEPARTED_OFFERING_USER_STATES),
+            field=common_utils.RELEASE_OFFERING_USER_FIELDS,
+        )
+        handlers.process_offering_user_deletions(offering, waldur_rest_client, departed)
+    except Exception:
+        logger.exception(
+            "Username backend reconciliation failed for offering %s", offering.name
+        )
 
 
 def run_periodic_order_reconciliation(
@@ -533,12 +583,7 @@ def run_periodic_order_reconciliation(
         if not offering.order_processing_backend:
             continue
         try:
-            waldur_rest_client = get_client(
-                offering.api_url,
-                offering.api_token,
-                user_agent,
-                verify_ssl=offering.verify_ssl,
-            )
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
 
             stuck_orders = marketplace_orders_list.sync_all(
                 client=waldur_rest_client,
@@ -551,16 +596,13 @@ def run_periodic_order_reconciliation(
                 continue
 
             logger.info(
-                "Order reconciliation: found %d stuck order(s) for %s "
-                "(modified before %s)",
+                "Order reconciliation: found %d stuck order(s) for %s (modified before %s)",
                 len(stuck_orders),
                 offering.name,
                 cutoff.isoformat(),
             )
 
-            order_processor = common_processors.OfferingOrderProcessor(
-                offering, waldur_rest_client
-            )
+            order_processor = common_processors.OfferingOrderProcessor(offering, waldur_rest_client)
             for order in stuck_orders:
                 touch_heartbeat()
                 try:
@@ -568,9 +610,100 @@ def run_periodic_order_reconciliation(
                 except Exception as e:
                     order_processor.log_order_processing_error(order, e)
         except Exception:
-            logger.exception(
-                "Order reconciliation failed for offering %s", offering.name
+            logger.exception("Order reconciliation failed for offering %s", offering.name)
+
+
+def run_periodic_api_key_reconciliation(
+    waldur_offerings: list[common_structures.Offering],
+    user_agent: str = "",
+    stuck_threshold_minutes: int = 30,
+    expose_backend_error_details: bool = True,
+) -> None:
+    """Re-issue rotations for API keys whose reply to Waldur never arrived.
+
+    A rotate command is a fire-and-forget STOMP message. If the agent is down when
+    it goes out, or the handler dies mid-way, the key stays ``Updating``: the portal
+    shows a spinner that never resolves, and the consumer cannot retry because
+    ``set_updating`` only accepts ``OK`` / ``Erred``.
+
+    Rotating again converges. Each rotation applies a fresh value before removing
+    the old one and then reports it, and deleting an already-absent key is a no-op,
+    so re-running the rotation a backend already completed still ends with one live
+    key that Waldur knows the value of.
+
+    Only picks up keys older than ``stuck_threshold_minutes`` (default 30) so a
+    rotation still in flight is left alone, and only for offerings whose backend
+    manages resource API keys.
+
+    ``expose_backend_error_details`` is threaded through because this sweep rotates
+    the same keys the STOMP handler does. Left on the default, an agent that opted
+    out of raw backend errors still got them by this route.
+    """
+    cutoff = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(
+        minutes=stuck_threshold_minutes
+    )
+
+    for offering in waldur_offerings:
+        touch_heartbeat()
+        if not offering.order_processing_backend:
+            continue
+        try:
+            backend, _ = get_backend_for_offering(offering, "order_processing_backend")
+            if not getattr(backend, "supports_resource_api_keys", False):
+                continue
+
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
+            stuck_keys = marketplace_resource_api_keys_list.sync_all(
+                client=waldur_rest_client,
+                offering_uuid=offering.waldur_offering_uuid,
+                state=[ResourceApiKeyState.UPDATING],
+                modified_before=cutoff,
             )
+
+            if not stuck_keys:
+                continue
+
+            logger.info(
+                "API key reconciliation: found %d stuck key(s) for %s (modified before %s)",
+                len(stuck_keys),
+                offering.name,
+                cutoff.isoformat(),
+            )
+
+            for api_key in stuck_keys:
+                touch_heartbeat()
+                # The STOMP handler rejects these; the sweep reads the same fields
+                # off a list response where client_id is Union[Unset, str], so it
+                # has to as well. An Unset object would otherwise be interpolated
+                # into a backend URL, and an empty backend id makes envoy's pause
+                # check see no siblings and re-provision the key active.
+                if not api_key.client_id:
+                    logger.warning(
+                        "Skipping API key %s: no client_id to rotate from", api_key.uuid
+                    )
+                    continue
+                if not api_key.resource_backend_id:
+                    logger.warning(
+                        "Skipping API key %s: the resource has no backend id",
+                        api_key.uuid,
+                    )
+                    continue
+                try:
+                    common_utils.rotate_resource_api_key(
+                        waldur_rest_client,
+                        api_key.uuid.hex,
+                        api_key.client_id,
+                        backend,
+                        api_key.resource_backend_id,
+                        api_key.resource_uuid.hex,
+                        expose_backend_error_details=expose_backend_error_details,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to re-issue the rotation of API key %s", api_key.uuid
+                    )
+        except Exception:
+            logger.exception("API key reconciliation failed for offering %s", offering.name)
 
 
 def run_periodic_project_hierarchy_sync(
@@ -591,12 +724,7 @@ def run_periodic_project_hierarchy_sync(
         if not offering.membership_sync_backend:
             continue
         try:
-            waldur_rest_client = get_client(
-                offering.api_url,
-                offering.api_token,
-                user_agent,
-                verify_ssl=offering.verify_ssl,
-            )
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
             resource_backend, resource_backend_version = get_backend_for_offering(
                 offering, "membership_sync_backend"
             )
@@ -608,18 +736,14 @@ def run_periodic_project_hierarchy_sync(
             )
             processor.sync_all_resource_projects()
         except Exception:
-            logger.exception(
-                "Project hierarchy sync failed for offering %s", offering.name
-            )
+            logger.exception("Project hierarchy sync failed for offering %s", offering.name)
 
 
 def send_agent_health_checks(offerings: list[common_structures.Offering], user_agent: str) -> None:
     """Sends agent health checks for the specified offerings."""
     for offering in offerings:
         try:
-            waldur_rest_client = get_client(
-                offering.api_url, offering.api_token, user_agent, verify_ssl=offering.verify_ssl
-            )
+            waldur_rest_client = get_client_for_offering(offering, user_agent)
             processor = common_processors.OfferingOrderProcessor(offering, waldur_rest_client)
             marketplace_orders_list.sync(
                 client=processor.waldur_rest_client, offering_uuid=offering.uuid

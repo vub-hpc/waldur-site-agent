@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from waldur_site_agent.backend.backends import BaseBackend
 from waldur_site_agent.backend.exceptions import BackendError
 from waldur_site_agent.backend.quota import (
     HomedirQuotaConfig,
@@ -14,47 +13,12 @@ from waldur_site_agent.backend.quota import (
     get_user_homedir,
 )
 
+from tests.fixtures import ConcreteBackend
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class ConcreteBackend(BaseBackend):
-    """Minimal concrete subclass for testing BaseBackend.create_user_homedirs."""
-
-    def ping(self, raise_exception=False):
-        return True
-
-    def list_backend_components(self):
-        return []
-
-    def list_components(self):
-        return []
-
-    def _get_usage_report(self, resource_backend_ids):
-        return {}
-
-    def _collect_resource_limits(self, waldur_resource):
-        return {}, {}
-
-    def _pre_create_resource(self, *args, **kwargs):
-        pass
-
-    def diagnostics(self):
-        return {}
-
-    def downscale_resource(self, *args, **kwargs):
-        pass
-
-    def get_resource_metadata(self, *args, **kwargs):
-        return {}
-
-    def pause_resource(self, *args, **kwargs):
-        pass
-
-    def restore_resource(self, *args, **kwargs):
-        pass
 
 
 def _make_backend(settings=None, components=None):
@@ -438,3 +402,51 @@ class TestCreateUserHomedirsWithQuota:
         backend.create_user_homedirs({"alice"})
         backend.client.create_linux_user_homedir.assert_called_once()
         backend.client.execute_command.assert_not_called()
+
+    def test_existing_homedir_skips_creation(self, monkeypatch):
+        from pathlib import Path
+
+        backend = _make_backend(settings={"homedir_base_path": "/cephfs/home"})
+        monkeypatch.setattr(
+            Path, "is_dir", lambda self: str(self) == "/cephfs/home/alice"
+        )
+
+        backend.create_user_homedirs({"alice"})
+
+        # mkhomedir_helper is not invoked for the already-present homedir
+        backend.client.create_linux_user_homedir.assert_not_called()
+
+    def test_existing_homedir_still_reconciles_quota(self, monkeypatch):
+        from pathlib import Path
+
+        backend = _make_backend(
+            settings={
+                "homedir_base_path": "/cephfs/home",
+                "homedir_quota": {
+                    "provider": "ceph_xattr",
+                    "max_bytes": "1T",
+                },
+            }
+        )
+        backend.client.execute_command.return_value = "1T"
+        monkeypatch.setattr(Path, "is_dir", lambda self: True)
+
+        backend.create_user_homedirs({"alice"})
+
+        # Creation is skipped, but quota is still applied (setfattr + getfattr)
+        backend.client.create_linux_user_homedir.assert_not_called()
+        assert backend.client.execute_command.call_count == 2
+
+    def test_missing_base_path_does_not_crash(self, monkeypatch):
+        from pathlib import Path
+
+        # Without homedir_base_path the early-exit check must be skipped rather
+        # than attempting to build a path from a None base path.
+        backend = _make_backend()
+        monkeypatch.setattr(
+            Path, "is_dir", lambda self: pytest.fail("is_dir must not be called")
+        )
+
+        backend.create_user_homedirs({"alice"})
+
+        backend.client.create_linux_user_homedir.assert_called_once_with("alice", "0077")

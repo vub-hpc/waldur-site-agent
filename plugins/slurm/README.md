@@ -56,6 +56,7 @@ offerings:
     backend_settings:
       # Core SLURM account management
       default_account: "root"
+      # root_account: "root"   # optional, see "Account settings" below
       customer_prefix: "waldur_"
       project_prefix: "waldur_"
       allocation_prefix: "waldur_"
@@ -71,6 +72,79 @@ offerings:
         unit: "GPU-Hours"
         unit_factor: 60
 ```
+
+### REST API Execution Mode (optional)
+
+The plugin can talk to [slurmrestd](https://slurm.schedmd.com/slurmrestd.html)
+instead of shelling out to `sacctmgr`/`scancel` for account, association,
+QoS and limit management. Usage reporting still uses `sacct` (the REST API
+has no `sreport` equivalent) — see
+[docs/slurm-rest-api-design.md](../../docs/slurm-rest-api-design.md) for the
+full design, scope and limitations.
+
+```yaml
+offerings:
+  - name: "My SLURM Cluster"
+    backend_type: "slurm"
+    backend_settings:
+      # ... basic settings as above ...
+      cluster_name: "mycluster"      # required in REST mode
+      execution_mode: "rest"         # "cli" (default) | "rest"
+      rest_api:
+        # http(s)://host:port or unix:///path/to/socket
+        url: "unix:///run/slurmrestd/slurmrestd.sock"
+        api_version: "v0.0.43"
+        username: "waldur-agent"
+        token_file: "/etc/waldur/slurmrestd.token"
+        # token_env: SLURM_JWT       # alternative to token_file
+```
+
+Requires the optional `httpx` dependency:
+
+```bash
+pip install 'waldur-site-agent-slurm[rest]'
+```
+
+The JWT token is re-read from `token_file` on HTTP 401, so an external
+rotator (e.g. a cron job running `scontrol token`) keeps the agent working
+without restarts. Recommended SLURM version for REST mode: 25.11 or newer.
+
+### Account settings: users vs. accounts
+
+Two settings control how the agent places objects in the SLURM account tree.
+They serve **different** purposes and are easy to confuse:
+
+- **`default_account`** applies to **users**. It is the `DefaultAccount=` set
+  on every user association — the account a user's jobs charge against when they
+  don't pass `-A`. Set it to a restricted account (e.g. `restricted_access`) to
+  stop users from submitting under the root account by default.
+- **`root_account`** applies to **accounts**. It is the parent under which the
+  top-tier (customer) account of the default hierarchy is created — i.e. the
+  real root of the account tree. Optional; defaults to the value of
+  `default_account`, then to `"root"`.
+
+In the default 3-tier hierarchy the agent creates
+`root_account → customer → project → allocation`. Under the default
+`default_account_policy: common`, every user association gets
+`DefaultAccount=default_account`. The `individual` and `none` policies
+change which account (if any) is used — see
+[Upgrading](docs/upgrading.md#default_account_policy) for the trade-offs.
+
+Historically a single `default_account` setting was used for **both** roles.
+That is correct only when both values are the same (e.g. both `"root"`, as in
+the examples above). If you want users to default to a restricted account
+**without** parenting the whole account tree under it, set the two
+independently:
+
+```yaml
+backend_settings:
+  default_account: "restricted_access"  # users land here by default
+  root_account: "root"                  # account tree is rooted at root
+```
+
+> A flat hierarchy (project account created directly under a fixed parent,
+> with no customer tier) is configured separately via the `parent_account`
+> setting; when `parent_account` is set, `root_account` is not used.
 
 ### Periodic Limits Configuration
 
@@ -97,6 +171,44 @@ QoS state (normal / downscaled / paused) is driven by the resource flags
 `paused` / `downscaled` set by Waldur Mastermind and applied by the agent
 through the top-level `qos_default` / `qos_downscaled` / `qos_paused`
 backend settings — the same path used by manual pause/downscale.
+
+### QoS enforcement (multi-QoS offerings)
+
+When an offering exposes multiple QoS profiles per partition, the plugin can
+switch from the QoS-swap model above to a **per-association QoS grant**: in this
+mode `add_user` reads the QoS (and optional partition) the consumer selected at
+order time and grants it on the user→account association (`QosLevel` /
+`DefaultQOS`), rather than mutating the account-level QoS.
+
+Enforcement is **opt-in on the agent**. It stays off — regardless of any
+offering's `plugin_options.enforce_qos` — until the operator enables the
+`qos_enforcement_enabled` gate, so a remote flag can never make the agent mutate
+SLURM QoS without consent:
+
+```yaml
+backend_settings:
+  qos_enforcement_enabled: true     # opt-in gate (default false)
+  # Once opted in, scope enforcement:
+  #   enforce_offering_qos: null    # (default) respect each offering's flag
+  #   enforce_offering_qos: true    # force enforcement for every offering
+  #   enforce_offering_qos: false   # force informational mode
+  # Optional per-offering partition scoping still applies (see above):
+  # offering_partitions + enforce_offering_partitions.
+```
+
+- **Partition scope.** The grant is scoped to the consumer's selected
+  partition; if none was selected it spans the enforced `offering_partitions`,
+  else the `default_partition`. QoS composes with partitions — SLURM stores one
+  association row per partition, each carrying the grant.
+- **Pause / downscale.** Because the association QoS is a grant (not the
+  operational lever), pause/downscale block new submissions with
+  `GrpSubmitJobs=0` and restore clears it (`GrpSubmitJobs=-1`), leaving the QoS
+  grant untouched. The `qos_paused` / `qos_downscaled` settings are **not** used
+  in this mode (and forcing enforcement together with them is rejected at config
+  validation).
+- **Execution modes.** Both `cli` and `rest` execution modes implement the QoS
+  grant and the `GrpSubmitJobs` lever. In REST mode the grant is a single
+  `users_association` POST whose `association` template carries the QoS.
 
 ### Storage Quotas
 
@@ -782,6 +894,38 @@ result = backend.apply_periodic_settings('test_account', {'fairshare': 100})
 print(result)
 "
 ```
+
+### Verifying a raw-usage reset on the cluster
+
+When a periodic policy resets raw usage, Mastermind emits an
+`apply_periodic_settings` message with `reset_raw_usage: true`, and this plugin
+runs `sacctmgr modify account <account> set RawUsage=0`. The account name is the
+Waldur resource's `backend_id`. To confirm what actually happened on SLURM —
+independent of what the Waldur UI shows — use these commands (replace
+`waldur_project123` with the account):
+
+```bash
+# Ground-truth run time and actor of the reset (SLURM's own audit log)
+sacctmgr show transactions Start=2024-01-01 \
+  format=TimeStamp,Actor,Action,Info,Where
+
+# Current raw (fair-share) usage — refreshed every PriorityCalcPeriod (~5 min),
+# so it will not read exactly 0 shortly after a reset
+sshare -A waldur_project123 -o Account,User,RawUsage,GrpTRESRaw
+
+# Confirm SLURM is not also auto-resetting usage on its own schedule.
+# PriorityUsageResetPeriod = NONE means resets come only from this plugin.
+scontrol show config | grep -iE 'Priority(DecayHalfLife|UsageResetPeriod|CalcPeriod)'
+
+# The limit the reset is measured against
+sacctmgr show assoc account=waldur_project123 \
+  format=Account,User,GrpTRESMins,GrpTRES,Fairshare
+```
+
+> **Note:** the `executed_at` timestamp in the Waldur execution log is
+> Mastermind's **emit** time, not the cluster run time. `sacctmgr show
+> transactions` above is the authoritative source for when the reset actually
+> applied. Reconcile all timestamps in UTC before drawing conclusions.
 
 ## Support
 

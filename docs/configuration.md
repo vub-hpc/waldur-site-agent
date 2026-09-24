@@ -1,6 +1,16 @@
 # Configuration Reference
 
-This document provides a complete reference for configuring Waldur Site Agent.
+This document provides a complete reference for configuring Waldur Site Agent. It's a reference,
+not a tutorial — if this is your first setup, start with the [Quickstart](quickstart.md) instead
+and come back here once something needs a field this page covers but the Quickstart didn't.
+
+**Required in every offering**, regardless of backend: [`name`](#name),
+[`waldur_api_url`](#waldur_api_url), [`waldur_api_token`](#waldur_api_token),
+[`waldur_offering_uuid`](#waldur_offering_uuid), a `*_backend` setting for each process you run
+(e.g. `order_processing_backend`), and at least one entry under
+[`backend_components`](#backend-components). Everything else on this page — global settings,
+event processing, resource management, backend-specific `backend_settings`, and the ~15 optional
+component fields — has a working default and can be added when you actually need it.
 
 ## Configuration File Structure
 
@@ -83,6 +93,15 @@ Each offering in the `offerings` array represents a separate service offering.
 - **Required**: Yes
 - **Description**: UUID of the offering in Waldur
 - **Note**: Found in Waldur UI under Integration -> Credentials
+- **Supported offering types**: Waldur accepts an agent identity only for an offering whose type
+  is `Waldur site agent` (`Marketplace.Slurm`), `Script` (`Marketplace.Script`), `Basic`
+  (`Marketplace.Basic`) or `OpenStack tenant` (`OpenStack.Tenant`). Point an agent at any other
+  type — a service desk offering, say — and identity registration is refused with a misleading
+  `400 Object with uuid=... does not exist`, even though the offering is there. The agent logs a
+  warning and carries on syncing without agent telemetry; see
+  [Agent Identity Registration Is Refused](deployment.md#agent-identity-registration-is-refused).
+  The set of accepted types is a property of the Waldur server, so it can differ between Waldur
+  versions.
 
 ### Backend Configuration
 
@@ -112,6 +131,10 @@ username_management_backend: "base"  # Backend for username management
 - `"waldur"`: Waldur-to-Waldur federation
 - `"base"`: Basic username management
 - `"rancher"`: Direct Rancher REST API integration (single offering = one cluster)
+- `"ceph_s3"`: Ceph S3 storage (croit and RadosGW flavours)
+- `"digitalocean"`: DigitalOcean droplets
+- `"azure"`: Azure virtual machines. See
+  [`plugins/azure/README.md`](../plugins/azure/README.md).
 - `"rancher-kc-crd"`: CRD-driven Rancher + Keycloak management via the
   [`rancher-keycloak-operator`](https://github.com/waldur/rancher-keycloak-operator).
   Membership-sync only; targets multiple clusters per offering by reading
@@ -129,6 +152,19 @@ username_management_backend: "base"  # Backend for username management
 - **Default**: `false`
 - **Description**: Enable STOMP-based event processing
 
+#### `stomp_membership_sync_enabled`
+
+- **Type**: Boolean or null
+- **Default**: `null` (inherits `stomp_enabled`)
+- **Description**: Controls whether membership sync uses STOMP events or HTTP
+  polling.  When `stomp_enabled` is `true` this defaults to `true` as well.
+  Set to `false` to keep HTTP polling for membership sync while using STOMP for
+  order processing.
+- **Note**: Setting this to `true` while `stomp_enabled` is `false` leaves
+  membership sync with no runner at all — the polling agent skips it (assuming
+  STOMP owns it) and the STOMP consumers never start. The agent logs a
+  `MISCONFIGURATION` warning on startup if it sees this combination.
+
 #### `websocket_use_tls`
 
 - **Type**: Boolean
@@ -142,6 +178,20 @@ username_management_backend: "base"  # Backend for username management
 - **Type**: Boolean
 - **Default**: `false`
 - **Description**: Whether to expose importable resources to Waldur
+
+#### `preserve_unmanaged_backend_users`
+
+- **Type**: Boolean
+- **Default**: `false`
+- **Description**: Controls how membership sync treats backend users who are
+  not on the Waldur resource team. When `false` (default), any such user is
+  removed. When `true`, users Waldur has ever known as offering users of this
+  offering (any state, including `DELETED` and restricted) are removed once
+  they leave the team; accounts Waldur has never seen — for example people
+  the service provider added locally because Waldur validation blocked their
+  offering user — are kept. Applies to every local-username backend
+  (SLURM, MOAB, MUP, OKD, Harbor, …). Ignored for identity-bridge /
+  Waldur-to-Waldur federation.
 
 ## Common Backend Settings
 
@@ -171,13 +221,37 @@ These settings can be used in `backend_settings` for any backend type.
   `project_slug` account name generation policy is used. Set to a lower value
   if collisions are rare or a higher value for large deployments.
 
+### Account name generation vs. resource slug templates
+
+The offering's `account_name_generation_policy` plugin option (set in Waldur,
+not in the agent config) controls how the agent derives a resource's backend ID
+(e.g. the SLURM account name):
+
+- **Unset (default)** — the agent uses the resource's slug verbatim:
+  `{allocation_prefix}{resource_slug}`. If the offering also defines a
+  `resource_slug_template` (e.g. `{project_slug}-{counter}`), the slug is already
+  unique and is used as-is, with **no extra suffix**.
+- **`project_slug`** — the agent **ignores the resource slug** and instead
+  derives the backend ID from the *project* slug, appending an incrementing
+  `-{counter}` on each collision to disambiguate multiple resources in the same
+  project.
+
+> **Warning:** `account_name_generation_policy: project_slug` and
+> `resource_slug_template` are two mutually exclusive ways to make backend IDs
+> unique. If you set both, the `project_slug` policy wins and appends its own
+> counter on top of (and ignoring) your template — producing IDs like
+> `prefix-test-prj-01-2-31`. If you use a `resource_slug_template`, leave
+> `account_name_generation_policy` **unset** so the unique slug is used directly.
+
 ## Backend-Specific Settings
 
 ### SLURM Backend Settings
 
 ```yaml
 backend_settings:
-  default_account: "root"                              # Default parent account
+  default_account: "root"                              # DefaultAccount= on user associations
+  # root_account: "root"                               # Parent of top-tier customer account
+  # default_account_policy: "common"                   # common (default) | individual | none
   customer_prefix: "hpc_"                              # Prefix for customer accounts
   project_prefix: "hpc_"                               # Prefix for project accounts
   allocation_prefix: "hpc_"                            # Prefix for allocation accounts
@@ -232,6 +306,7 @@ backend_settings:
     PROJECT.ADMIN: PROJECT.ADMIN
     PROJECT.MANAGER: PROJECT.MANAGER
   end_date_sync_direction: "bidirectional"   # a_to_b | b_to_a | bidirectional | disabled
+  limit_sync_direction: "b_to_a"             # b_to_a (default) | disabled -- limit sync
   passthrough_attributes: []                 # Offering attribute keys forwarded verbatim to B
   fetch_consented_users_only: false          # Only sync users with data-sharing consent
   # Optional: target STOMP for instant async order completion

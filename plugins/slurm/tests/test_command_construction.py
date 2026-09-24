@@ -167,7 +167,23 @@ class TestCommandPrefixByMethod:
         """set_account_qos uses sacctmgr with all standard flags."""
         c, _ = client
         c.set_account_qos("acct1", "normal")
-        assert self._get_command(c).startswith("sacctmgr --parsable2 --noheader --immediate")
+        cmd = self._get_command(c)
+        assert cmd.startswith("sacctmgr --parsable2 --noheader --immediate")
+        assert cmd.endswith("modify account acct1 set qos=normal")
+        assert "defaultqos" not in cmd
+
+    def test_set_account_qos_with_default_in_one_command(self, client):
+        """qos= and defaultqos= go into a single modify so slurmdbd's check passes."""
+        c, _ = client
+        c.set_account_qos("acct1", "stop", default_qos="stop")
+        assert self._get_command(c).endswith("modify account acct1 set qos=stop defaultqos=stop")
+
+    def test_get_current_account_default_qos(self, client):
+        c, _ = client
+        c.get_current_account_default_qos("acct1")
+        cmd = self._get_command(c)
+        assert cmd.startswith("sacctmgr --parsable2 --noheader --immediate")
+        assert cmd.endswith("list associations format=account,defaultqos where account=acct1")
 
     def test_get_association(self, client):
         """get_association uses sacctmgr with all standard flags."""
@@ -185,7 +201,80 @@ class TestCommandPrefixByMethod:
         """delete_association uses sacctmgr with all standard flags."""
         c, _ = client
         c.delete_association("user1", "acct1")
-        assert self._get_command(c).startswith("sacctmgr --parsable2 --noheader --immediate")
+        # The user's associations are listed first; the removal is the last command.
+        assert self._get_command(c, -1).startswith("sacctmgr --parsable2 --noheader --immediate")
+        assert "remove user where name=user1 and account=acct1" in self._get_command(c, -1)
+
+    def test_delete_default_association_repoints_the_default_first(self, client):
+        """slurmdbd refuses to drop a default association while others remain."""
+        c, mock_exec = client
+        # The listing ignores `where` and carries other users; names come back folded.
+        mock_exec.side_effect = [
+            "root|root\nuser1|acct1\nuser1|acct2\nother|acct9\n",
+            "root|root\nuser1|acct1\n",
+            "",
+            "",
+        ]
+        c.delete_association("user1", "Acct1")
+        commands = c.executed_commands
+        assert "modify user where name=user1 set DefaultAccount=acct2" in commands[-2]
+        assert "remove user where name=user1 and account=Acct1" in commands[-1]
+
+    def test_delete_all_users_repoints_a_default_account_first(self, client):
+        """The whole-account teardown hits the same slurmdbd restriction."""
+        c, mock_exec = client
+        mock_exec.side_effect = [
+            # list_resource_users(acc1): the account row plus one user row.
+            "acc1|\nacc1|user1\n",
+            # get_user_default_account(user1)
+            "user1|acc1\n",
+            # list_user_accounts(user1): it holds another account as well.
+            "user1|acc1\nuser1|acc2\n",
+            # set_user_default_account(user1, acc2)
+            "",
+            # the bulk removal
+            "",
+        ]
+        c.delete_all_users_from_account("acc1")
+        commands = c.executed_commands
+        assert "modify user where name=user1 set DefaultAccount=acc2" in commands[-2]
+        assert "remove user where account=acc1" in commands[-1]
+
+    def test_delete_all_users_leaves_an_unrelated_default_alone(self, client):
+        c, mock_exec = client
+        mock_exec.side_effect = [
+            "acc1|\nacc1|user1\n",
+            # user1 defaults to another account, so nothing is re-pointed.
+            "user1|acc2\n",
+            "",
+        ]
+        c.delete_all_users_from_account("acc1")
+        assert not any("DefaultAccount=" in cmd for cmd in c.executed_commands)
+        assert "remove user where account=acc1" in c.executed_commands[-1]
+
+    def test_delete_non_default_association_leaves_the_default_alone(self, client):
+        c, mock_exec = client
+        mock_exec.side_effect = ["user1|acct1\nuser1|acct2\n", "user1|acct1\n", ""]
+        c.delete_association("user1", "acct2")
+        assert not any("DefaultAccount=" in cmd for cmd in c.executed_commands)
+        assert "remove user where name=user1 and account=acct2" in c.executed_commands[-1]
+
+    def test_get_user_default_account_matches_the_row_by_name(self, client):
+        """A listing seeded with other users (root first) must not hand back theirs."""
+        c, mock_exec = client
+        mock_exec.return_value = "root|root\nalice|acct9\nuser1|acct2\n"
+        assert c.get_user_default_account("user1") == "acct2"
+        assert c.get_user_default_account("nobody") is None
+        mock_exec.return_value = "user1|\n"
+        assert c.get_user_default_account("user1") is None
+
+    def test_delete_last_association_removes_the_user(self, client):
+        c, mock_exec = client
+        # Another user's rows in the listing must not count as "remaining".
+        mock_exec.side_effect = ["root|root\nuser1|acct1\nother|acct2\n", ""]
+        c.delete_association("user1", "acct1")
+        assert c.executed_commands[-1].endswith("remove user where name=user1")
+        assert not any("account=acct1" in cmd and "remove" in cmd for cmd in c.executed_commands)
 
     def test_list_resource_users(self, client):
         """list_resource_users uses sacctmgr with all standard flags."""
@@ -216,6 +305,36 @@ class TestCommandPrefixByMethod:
         c, _ = client
         c.reset_raw_usage("acct1")
         assert self._get_command(c).startswith("sacctmgr --parsable2 --noheader --immediate")
+
+    def test_set_qos_grp_tres_mins(self, client):
+        """set_qos_grp_tres_mins modifies the QoS, not the account."""
+        c, _ = client
+        c.set_qos_grp_tres_mins("acct1", {"billing": 19854000, "gres/gpu": 300000})
+        cmd = self._get_command(c)
+        assert cmd.startswith("sacctmgr --parsable2 --noheader --immediate")
+        assert "modify qos acct1 set GrpTRESMins=" in cmd
+        assert "billing=19854000" in cmd
+        assert "gres/gpu=300000" in cmd
+        assert "modify account" not in cmd
+
+    def test_get_qos_grp_tres_mins(self, client):
+        """get_qos_grp_tres_mins uses show qos without --immediate."""
+        c, mock_exec = client
+        mock_exec.return_value = "acct1|billing=14428800,gres/gpu=216000\n"
+        result = c.get_qos_grp_tres_mins("acct1")
+        cmd = self._get_command(c)
+        assert cmd.startswith("sacctmgr --parsable2 --noheader")
+        assert "--immediate" not in cmd
+        assert "show qos acct1" in cmd
+        assert result == {"billing": 14428800, "gres/gpu": 216000}
+
+    def test_reset_qos_raw_usage(self, client):
+        """reset_qos_raw_usage uses sacctmgr with all standard flags."""
+        c, _ = client
+        c.reset_qos_raw_usage("acct1")
+        cmd = self._get_command(c)
+        assert cmd.startswith("sacctmgr --parsable2 --noheader --immediate")
+        assert "modify qos acct1 set RawUsage=0" in cmd
 
     def test_get_account_fairshare_method(self, client):
         """get_account_fairshare uses sacctmgr with all standard flags."""
@@ -310,6 +429,22 @@ class TestCommandPrefixByMethod:
         assert "--noheader" not in cmd
         assert "--immediate" not in cmd
 
+    def test_check_user_exists_unknown_user_is_false(self, client):
+        from waldur_site_agent.backend.exceptions import BackendError
+
+        c, mock_exec = client
+        mock_exec.side_effect = BackendError("id: 'ghost': no such user")
+        assert c.check_user_exists("ghost") is False
+
+    def test_check_user_exists_missing_id_binary_is_a_clean_error(self, client):
+        """A host without ``id`` used to crash with UnboundLocalError; now a BackendError."""
+        from waldur_site_agent.backend.exceptions import BackendError
+
+        c, mock_exec = client
+        mock_exec.side_effect = BackendError("Command not found: ['/usr/bin/id', '-u', 'user1']")
+        with pytest.raises(BackendError, match="Cannot check whether user user1 exists"):
+            c.check_user_exists("user1")
+
 
 class TestModifyNothingChanged:
     """sacctmgr returns exit-code 1 with 'Nothing modified' when a modify
@@ -392,7 +527,7 @@ class TestClusterFiltering:
 
     def test_delete_association_includes_cluster(self, client_with_cluster):
         client_with_cluster.delete_association("user1", "acct1")
-        assert "cluster=mycluster" in client_with_cluster.executed_commands[0]
+        assert "cluster=mycluster" in client_with_cluster.executed_commands[-1]
 
     def test_show_association_includes_cluster(self, client_with_cluster):
         client_with_cluster.account_has_users("acct1")
@@ -510,10 +645,9 @@ class TestClusterFilteringWithEmulator:
             """Route a full command list (with binary prefix) to the emulator."""
             # Determine which emulator to use from the binary name
             binary = command_parts[0].rsplit("/", 1)[-1]
-            # Pass flags through: emulator >= 0.6.0 understands
-            # --parsable2/--noheader/--immediate and, like real SLURM,
-            # emits table output when --parsable2 is absent.
-            args = command_parts[1:]
+            # Strip the binary prefix; the emulator follows the control flags
+            # (--parsable2/--noheader/--immediate) like real SLURM.
+            args = list(command_parts[1:])
             if binary == "sacctmgr":
                 return sacctmgr.handle_command(args)
             if binary == "sacct":
@@ -651,3 +785,40 @@ class TestClusterFilteringWithEmulator:
         assert qos.flags == "DenyOnLimit,NoDecay"
         assert qos.grp_tres == "cpu=100"
         assert qos.max_jobs == 50
+
+
+class TestDescriptionSanitization:
+    """Newlines and quotes in descriptions must not break sacctmgr (issue #17)."""
+
+    @pytest.fixture
+    def client(self):
+        client = SlurmClient({"cpu": "CPU"}, slurm_bin_path="")
+        with patch.object(client, "execute_command", return_value=""):
+            yield client
+
+    def test_newlines_collapsed_in_create_resource(self, client):
+        """A multi-line description is flattened to a single space-joined line."""
+        client.create_resource("acct1", "line one\nline two\r\nline three", "org")
+        cmd = client.executed_commands[0]
+        assert "\n" not in cmd
+        assert "\r" not in cmd
+        assert 'description="line one line two line three"' in cmd
+
+    def test_quotes_and_whitespace_stripped(self, client):
+        """Quotes are removed and whitespace runs collapsed."""
+        assert client._sanitize_sacctmgr_value('a "quote"\t and\n\n newlines') == "a quote and newlines"
+
+    def test_parse_account_tolerates_truncated_line(self, client):
+        """A record split by a stored newline must not raise IndexError."""
+        resource = client._parse_account("2026_084|2026_084: gpu-accelerated integration of")
+        assert resource.name == "2026_084"
+        assert resource.organization == ""
+
+    def test_get_resource_survives_newline_corrupted_account(self):
+        """get_resource returns a resource instead of crashing on a broken record."""
+        client = SlurmClient({"cpu": "CPU"}, slurm_bin_path="")
+        broken = "2026_084|2026_084: gpu-accelerated integration of\ntranscriptomics data|2026_084"
+        with patch.object(client, "execute_command", return_value=broken):
+            resource = client.get_resource("2026_084")
+        assert resource is not None
+        assert resource.name == "2026_084"

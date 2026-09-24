@@ -15,7 +15,7 @@ from waldur_site_agent.event_processing import handlers
 @mock.patch(
     "waldur_site_agent.common.agent_identity_management.marketplace_site_agent_identities_create"
 )
-@mock.patch("waldur_site_agent.event_processing.handlers.common_utils.get_client")
+@mock.patch("waldur_site_agent.event_processing.handlers.common_utils.get_client_for_offering")
 @mock.patch("waldur_site_agent.event_processing.handlers.common_processors.OfferingOrderProcessor")
 class TestOrderStateFiltering(unittest.TestCase):
     """Test order state filtering in message handlers."""
@@ -63,6 +63,32 @@ class TestOrderStateFiltering(unittest.TestCase):
         mock_identity_list.sync.assert_not_called()
         mock_service_register.sync.assert_not_called()
 
+    def test_stomp_handler_skips_non_actionable_orders(
+        self,
+        mock_processor_class,
+        mock_get_client,
+        mock_identity_create,
+        mock_identity_list,
+        mock_service_register,
+    ):
+        """Orders in states an agent can never act on are dropped before any
+        REST calls. Mastermind emits an event for every state transition, so
+        these arrive routinely."""
+        for state in ["canceled", "rejected", "pending-project", "pending-start-date"]:
+            with self.subTest(state=state):
+                message = {"order_uuid": self.order_uuid, "order_state": state}
+
+                mock_frame = mock.Mock()
+                mock_frame.body = json.dumps(message)
+
+                handlers.on_order_message_stomp(mock_frame, self.offering, self.user_agent)
+
+                mock_processor_class.assert_not_called()
+                mock_get_client.assert_not_called()
+                mock_identity_create.sync.assert_not_called()
+                mock_identity_list.sync.assert_not_called()
+                mock_service_register.sync.assert_not_called()
+
     def test_stomp_handler_processes_executing_orders(
         self,
         mock_processor_class,
@@ -88,12 +114,7 @@ class TestOrderStateFiltering(unittest.TestCase):
         handlers.on_order_message_stomp(mock_frame, self.offering, self.user_agent)
 
         # Verify Waldur client was created
-        mock_get_client.assert_called_once_with(
-            self.offering.api_url,
-            self.offering.api_token,
-            self.user_agent,
-            self.offering.verify_ssl,
-        )
+        mock_get_client.assert_called_once_with(self.offering, self.user_agent)
 
         # Verify agent identity registration flow
         mock_identity_list.sync.assert_called_once()

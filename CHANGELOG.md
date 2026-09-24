@@ -1,5 +1,103 @@
 # Changelog
 
+## 1.0.8-rc.4 - 2026-09-22
+
+- **Core**: Release an offering user's backend account only once the backend confirms the removal succeeded, so a failed teardown no longer marks the account as released (waldur/waldur-mastermind#413).
+- **LDAP**: Release LDAP accounts when a user loses their last offering access, with the teardown half of the offering-user lifecycle now documented in `docs/offering-users.md` and the plugin README (waldur/waldur-mastermind#413).
+- **LDAP**: Add a new `ldap-roles` backend and extract the shared `ldap-client` package used by both LDAP plugins.
+- **LDAP**: Take usernames and POSIX ids from Waldur instead of reading them back from the directory (#17).
+- **Azure**: Move the Azure plugin into the agent, including provisioning, metering and naming support (#8).
+- **LiteLLM**: Add Open WebUI integration (#15).
+- **SLURM**: Add `preserve_unmanaged_backend_users` to keep users added directly by the provider during membership sync.
+- **SLURM**: Move the account `DefaultQOS` along with the QoS swap, and require slurm-emulator 0.9.5 for the corresponding test (#16).
+- **Core**: Stop membership sync from removing service and course accounts, and skip backend metadata writes when nothing changed.
+- **Core**: Keep polling and event-driven agents working when agent identity registration is unavailable or refused (#24, waldur/waldur-mastermind#385).
+- **Core**: Stop the health probe from importing the whole API client, cutting container start-up cost (#31).
+- **Core**: Fix `get_client` stripping hostname characters instead of the `/api` suffix.
+- **Rancher**: Fix four inaccuracies in the `rancher-kc-crd` example config.
+- **Security**: Upgrade anyio past CVE-2026-63374 and CVE-2026-64847; upgrade waldur-api-client to 8.1.3rc10.
+- **Tooling**: Refuse to cut a release from a branch behind the remote, and stop tagging when the changelog finds no commits; add developer quick-start steps to the plugin development guide.
+
+> 30 commits, 171 files changed (+21057/-1155)
+
+---
+
+## 1.0.7 - 2026-09-02
+
+### Highlights
+
+This release promotes the 1.0.6-rc series to a stable 1.0.7 and picks up
+waldur-api-client 8.1.2, keeping the agent aligned with the current Waldur
+Mastermind API surface. Operators getting started also get clearer onboarding
+documentation for obtaining an API token.
+
+### Improvements
+
+- **Core**: Upgrade `waldur-api-client` to 8.1.2 and adapt the order
+  processors, test harness, federation client and SLURM/federation E2E
+  suites to the updated client API.
+- **Docs**: Document how to obtain the API token from the Waldur UI in the
+  quickstart guide.
+
+### Statistics
+
+> 2 commits, 15 files changed (+103/-163 lines)
+
+---
+
+## 1.0.6-rc.20 - 2026-08-31
+
+- **Core**: Migrate agent to the unified pub/sub queue (WAL-10011).
+- **Nextcloud**: Add new Nextcloud plugin; delegate add_user/remove_user to batch methods.
+- **LiteLLM**: Add new LiteLLM plugin (#12).
+- **Envoy AI Gateway**: Add new Envoy AI Gateway plugin (WAL-10066).
+- **Ceph S3**: Rename croit-s3 plugin to ceph-s3 and add a radosgw flavour (RWA-56).
+- **SLURM**: Add optional slurmrestd REST API execution mode.
+- **SLURM**: Add QoS-scoped associations and qos-= operator; opt-in skip of QoS swap and GrpTRESMins on dedicated QoS (WAL-10154).
+- **SLURM**: Stop reparenting allocation accounts on project move and fix accounts orphaned at root after reparenting.
+- **SLURM**: Match account names case-insensitively, sanitize newlines in account descriptions (#17), and skip unchanged periodic settings to avoid redundant sacctmgr calls.
+- **Core**: Keep orders pending on evaluation failures and transient API errors, and extend 500 error handling to membership sync so valid resources are not marked erred.
+- **Core**: Make service/course account sync best-effort and read accounts via the offering-scoped endpoint.
+- **Core**: Allow omitting decreasing usage components instead of aborting the whole set_usage call, ensure 2 decimal places on usage data, and surface real past-period usage 400s (WAL-10071).
+- **Core**: Gate homedirs and periodic settings on declared backend capabilities; skip homedir creation for existing home dirs (gh-15).
+- **Core**: Flag backend users for removal when they leave all projects (gh-13) and fix mass user add and revoke.
+- **Core**: Skip non-actionable order states in the STOMP handler and fetch offering context once per forced resources sync.
+- **Core**: Fix liveness probe killing agent pods during long per-offering processing, and allow float values for the order process period.
+- **Core**: Fix crash on trimmed MePermission payload from /api/users/me.
+- **Core**: Report per-grant membership sync statuses and honor resource-scoped resync; group Sentry events by message for better deduplication.
+- **Waldur**: Fix reporting lifetime usage as current-month usage; skip no-op limit-update orders; keep federation users consented to a sibling offering in the shared project.
+- **Waldur**: Add configurable resource-limit sync direction (`limit_sync_direction`); sync project OECD code, industry flag and science sub-domain (WAL-10044); align resource end_date sync with project end_date sync (WAL-10000).
+- **CSCS DWDI**: Fix month-boundary usage misattribution (WAL-10166) and add inference usage reporting.
+- **Rancher KC CRD**: Fix misleading membership-sync logs, warn about unmapped role grants, and add a manual testing guide.
+- **Helm**: Add ServiceAccount support to the chart.
+- **Docs**: Add a Quickstart guide and document published packages, Helm chart repository and Artifact Hub verification.
+- **Security**: Bump cryptography, click and pyasn1 to address OSV scanner findings.
+
+> 85 commits, 206 files changed (+29547/-4711 lines)
+
+---
+
+## 1.0.5 - 2026-06-29
+
+### Highlights
+
+This release strengthens SLURM account management and broadens authentication options for the site agent. Operators gain finer control over how default accounts are assigned to users and can now decouple the SLURM root account from per-user default accounts. The agent can also authenticate against Waldur Mastermind using Bearer tokens, simplifying deployment in environments that don't use OIDC.
+
+### What's New
+
+- **SLURM**: Add a `default_account_policy` setting to control how default accounts are assigned to users.
+- **Core**: Add support for Bearer token authentication against Waldur Mastermind, alongside the existing OIDC flow.
+
+### Improvements
+
+- **SLURM**: Decouple the SLURM root account from the user default account, allowing independent configuration of each ([ONS-1240]).
+
+### Statistics
+
+> 3 commits, 29 files changed (+1087/-175 lines)
+
+---
+
 ## 1.0.5-rc.13 - 2026-06-18
 
 - **OpenNebula**: Add support for vLLM inference VMs, including a sample offering, model-by-name selection, and component `unit_factor` applied when sizing VMs.

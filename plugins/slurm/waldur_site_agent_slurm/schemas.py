@@ -7,12 +7,12 @@ based on actual SLURM plugin usage patterns and the periodic limits functionalit
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, model_validator
 
-from waldur_site_agent.backend.quota import HomedirQuotaConfig
 from waldur_site_agent.common.plugin_schemas import (
+    HomedirSettingsSchema,
     PluginBackendSettingsSchema,
     PluginComponentSchema,
 )
@@ -24,6 +24,18 @@ class SlurmLimitType(Enum):
     GRP_TRES_MINS = "GrpTRESMins"
     MAX_TRES_MINS = "MaxTRESMins"
     GRP_TRES = "GrpTRES"
+
+
+class ExecutionMode(str, Enum):
+    """How the SLURM backend talks to the cluster.
+
+    Inherits from ``str`` so the members compare equal to the raw YAML values
+    ("cli"/"rest") and serialize transparently, while still giving callers a
+    typed, exhaustive set of choices.
+    """
+
+    CLI = "cli"
+    REST = "rest"
 
 
 class SlurmComponentSchema(PluginComponentSchema):
@@ -108,6 +120,25 @@ class QosManagementConfig(PluginBackendSettingsSchema):
         default=None,
         description="Additional QoS names to attach to accounts (e.g., ['2cpu-single-host'])",
     )
+    skip_qos_swap: bool = Field(
+        default=False,
+        description=(
+            "When true, restore/pause/downscale do not overwrite the account QoS list "
+            "(no sacctmgr `set qos=`). Pause/downscale use GrpSubmitJobs=0 instead; "
+            "restore clears it with GrpSubmitJobs=-1. Same orthogonal lever as QoS "
+            "enforcement. Opt-in: dedicated per-account QoS must not be replaced by "
+            "qos_default/qos_paused/qos_downscaled. Default false keeps the classic "
+            "QoS-swap pause/restore path."
+        ),
+    )
+    apply_limits_to_qos: bool = Field(
+        default=False,
+        description=(
+            "When true, write/read GrpTRESMins on the per-account QoS instead of the "
+            "account association. Requires enabled and skip_qos_swap. Default false "
+            "keeps allocation limits on the account."
+        ),
+    )
 
 
 class LustreQuotaConfig(PluginBackendSettingsSchema):
@@ -145,16 +176,79 @@ class ProjectDirectoryConfig(PluginBackendSettingsSchema):
     )
 
 
-class SlurmBackendSettingsSchema(PluginBackendSettingsSchema):
+class SlurmRestApiConfig(PluginBackendSettingsSchema):
+    """slurmrestd connection settings (used when ``execution_mode`` is ``rest``)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    url: str = Field(
+        ...,
+        description=(
+            "slurmrestd endpoint: 'http(s)://host:port' or 'unix:///path/to/socket'. "
+            "slurmrestd speaks plain HTTP — use https only via a TLS-terminating proxy."
+        ),
+    )
+    api_version: str = Field(
+        default="v0.0.43",
+        description="Pinned slurmrestd data_parser API version (e.g. 'v0.0.43')",
+    )
+    username: str = Field(
+        ...,
+        description="User the agent authenticates as (sent in X-SLURM-USER-NAME)",
+    )
+    token_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Path to a file with the JWT token. Re-read on HTTP 401, so an "
+            "external rotator (e.g. cron running 'scontrol token') keeps the "
+            "agent working without restarts."
+        ),
+    )
+    token_env: Optional[str] = Field(
+        default=None,
+        description="Name of an environment variable holding the JWT token",
+    )
+    verify_ssl: bool = Field(
+        default=True,
+        description="Verify TLS certificates (for https endpoints behind a proxy)",
+    )
+    timeout: int = Field(default=30, description="HTTP request timeout in seconds")
+
+    @model_validator(mode="after")
+    def validate_token_source(self) -> SlurmRestApiConfig:
+        """Require at least one token source."""
+        if not self.token_file and not self.token_env:
+            msg = "rest_api requires either token_file or token_env to be set"
+            raise ValueError(msg)
+        return self
+
+
+class SlurmBackendSettingsSchema(HomedirSettingsSchema):
     """SLURM-specific backend settings validation.
 
     Based on actual SLURM plugin usage patterns from backend.py analysis.
+    Home directory settings come from ``HomedirSettingsSchema``, shared with
+    every other backend that declares ``supports_user_homedirs``.
     """
 
     model_config = ConfigDict(extra="allow")  # Allow additional settings
 
     # Core SLURM account management (required by backend.py)
     default_account: str = Field(..., description="Default parent account in SLURM cluster")
+    default_account_policy: Literal["common", "individual", "none"] = Field(
+        default="common",
+        description=(
+            "Controls the DefaultAccount= argument passed to 'sacctmgr add user'.\n"
+            "  common     — use the configured default_account (current behaviour).\n"
+            "  individual — use the resource account itself; avoids implicit\n"
+            "               associations with the org-level root account.\n"
+            "  none       — the agent does not manage the default: DefaultAccount= is\n"
+            "               omitted and slurmdbd's own rule applies, which makes a new\n"
+            "               user's first association their default and leaves an\n"
+            "               existing user's default unchanged. An empty DefaultAccount\n"
+            "               is not a reachable state once any association exists."
+        ),
+    )
     customer_prefix: str = Field(..., description="Prefix for customer account names")
     project_prefix: str = Field(..., description="Prefix for project account names")
     allocation_prefix: str = Field(..., description="Prefix for allocation account names")
@@ -169,6 +263,29 @@ class SlurmBackendSettingsSchema(PluginBackendSettingsSchema):
         ),
     )
 
+    # Optional: scope sacctmgr/sacct commands and REST payloads to one cluster
+    cluster_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "SLURM cluster name to scope operations to. "
+            "Optional in CLI mode, required when execution_mode is 'rest'."
+        ),
+    )
+
+    # Execution mode: shell out to SLURM CLI tools (default) or talk to slurmrestd
+    execution_mode: ExecutionMode = Field(
+        default=ExecutionMode.CLI,
+        description=(
+            "How to talk to SLURM: 'cli' (sacctmgr/sacct binaries, default) or "
+            "'rest' (slurmrestd REST API; usage reporting still uses sacct — "
+            "see docs/slurm-rest-api-design.md)"
+        ),
+    )
+    rest_api: Optional[SlurmRestApiConfig] = Field(
+        default=None,
+        description="slurmrestd connection settings, required when execution_mode is 'rest'",
+    )
+
     # Optional: default partition for user associations
     default_partition: Optional[str] = Field(
         default=None,
@@ -180,29 +297,41 @@ class SlurmBackendSettingsSchema(PluginBackendSettingsSchema):
     qos_downscaled: Optional[str] = Field(default=None, description="QoS for downscaled accounts")
     qos_paused: Optional[str] = Field(default=None, description="QoS for paused accounts")
 
+    # Opt-in gate for QoS enforcement. Off by default: enforcement never
+    # activates — regardless of any offering's plugin_options.enforce_qos —
+    # until the operator enables it here. This keeps a remote Mastermind flag
+    # from making the agent mutate SLURM QoS without the operator's consent.
+    qos_enforcement_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master opt-in for QoS enforcement on this agent. False (default) "
+            "disables enforcement for every offering regardless of the remote "
+            "plugin_options.enforce_qos flag. Set True to allow enforcement, "
+            "then scope it with enforce_offering_qos / the per-offering flag."
+        ),
+    )
+
+    # Enforcement override, applied ONLY when qos_enforcement_enabled is True
+    # (three-state):
+    #   None  — respect the per-offering plugin_options.enforce_qos flag (default)
+    #   True  — force enforcement for every offering this agent serves
+    #   False — force informational mode (never touch SLURM QoS) regardless of offering
+    # When enforcing, the agent grants the selected QoS on the user association
+    # (QosLevel/DefaultQOS) and uses an orthogonal pause lever (GrpSubmitJobs)
+    # instead of the account-QoS overwrite, so pausing never clobbers the grant.
+    enforce_offering_qos: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Override for per-offering QoS enforcement, applied only when "
+            "qos_enforcement_enabled is True. None (default) respects each "
+            "offering's plugin_options.enforce_qos; True forces enforcement; "
+            "False forces informational mode."
+        ),
+    )
+
     # Per-account QoS management (optional, for EFP-style deployments)
     qos_management: Optional[QosManagementConfig] = Field(
         default=None, description="Per-account QoS creation and management"
-    )
-
-    # User home directory management (used by backend.py)
-    enable_user_homedir_account_creation: Optional[bool] = Field(
-        default=True, description="Create home directories for users"
-    )
-    default_homedir_umask: Optional[str] = Field(
-        default="0077", description="Umask for created home directories"
-    )
-    homedir_base_path: Optional[str] = Field(
-        default=None,
-        description=(
-            "Base path for user home directories (e.g. '/cephfs/home'). "
-            "When set, quota is applied to {homedir_base_path}/{username}. "
-            "When unset, the path is looked up from the system passwd database."
-        ),
-    )
-    homedir_quota: Optional[HomedirQuotaConfig] = Field(
-        default=None,
-        description="Filesystem quota settings for user home directories",
     )
 
     # Project directory management (optional, for sites with shared project storage)
@@ -215,23 +344,85 @@ class SlurmBackendSettingsSchema(PluginBackendSettingsSchema):
         default=None, description="Periodic limits configuration"
     )
 
-    @field_validator("default_homedir_umask")
-    @classmethod
-    def validate_umask(cls, v: Optional[str]) -> Optional[str]:
-        """Validate that umask is a valid octal permission."""
+    @model_validator(mode="after")
+    def validate_qos_management_flags(self) -> SlurmBackendSettingsSchema:
+        """Reject incompatible qos_management flag combinations.
 
-        def _raise_umask_error(value: str) -> None:
-            msg = f"Invalid umask range: {value}"
+        ``enabled`` keeps its original meaning (create a dedicated QoS). The
+        new flags are opt-in and default false, so existing qos_management
+        configs are unchanged. ``apply_limits_to_qos`` needs that QoS to
+        exist and must not be paired with the account-QoS-swap restore path.
+        ``skip_qos_swap`` cannot coexist with qos_paused/qos_downscaled —
+        those names would never be applied. With ``skip_qos_swap``,
+        ``qos_default`` is also dead config (restore never applies it).
+        """
+        qos_mgmt = self.qos_management
+        if qos_mgmt is None:
+            return self
+        if qos_mgmt.apply_limits_to_qos:
+            if not qos_mgmt.enabled:
+                msg = (
+                    "qos_management.apply_limits_to_qos requires qos_management.enabled "
+                    "so a dedicated per-account QoS exists to hold GrpTRESMins"
+                )
+                raise ValueError(msg)
+            if not qos_mgmt.skip_qos_swap:
+                msg = (
+                    "qos_management.apply_limits_to_qos requires qos_management.skip_qos_swap "
+                    "— otherwise restore/pause would overwrite the QoS that holds the budget"
+                )
+                raise ValueError(msg)
+        if qos_mgmt.skip_qos_swap and (self.qos_paused or self.qos_downscaled):
+            msg = (
+                "qos_management.skip_qos_swap is set but qos_paused/qos_downscaled are "
+                "also set — the account-QoS-swap pause would never run. Remove "
+                "qos_paused/qos_downscaled from this offering."
+            )
             raise ValueError(msg)
+        if qos_mgmt.skip_qos_swap and self.qos_default and "qos_default" in self.model_fields_set:
+            msg = (
+                "qos_management.skip_qos_swap is set but qos_default is also set — "
+                "restore_resource will not apply qos_default. Remove qos_default "
+                "from this offering."
+            )
+            raise ValueError(msg)
+        return self
 
-        if v is not None:
-            try:
-                # Try to parse as octal
-                umask_value = int(v, 8)
-                max_umask = 0o777
-                if umask_value < 0 or umask_value > max_umask:
-                    _raise_umask_error(v)
-            except ValueError as e:
-                msg = f"default_homedir_umask must be valid octal permissions (e.g., '0077'): {e}"
-                raise ValueError(msg) from e
-        return v
+    @model_validator(mode="after")
+    def validate_qos_enforcement_conflict(self) -> SlurmBackendSettingsSchema:
+        """Reject forced QoS enforcement alongside the QoS-swap pause settings.
+
+        Forcing enforcement is incompatible with the account-QoS-swap
+        pause/downscale mechanism, which would clobber the per-association
+        grant. When enforcement is forced on, the enforced path uses an
+        orthogonal pause lever, so qos_paused/qos_downscaled must be dropped.
+        Only fires when enforcement is actually reachable — the opt-in gate is
+        on and enforcement is forced for every offering (so no offering could
+        legitimately still use the swap-based pause).
+        """
+        forced_everywhere = self.qos_enforcement_enabled and self.enforce_offering_qos is True
+        if forced_everywhere and (self.qos_paused or self.qos_downscaled):
+            msg = (
+                "qos_enforcement_enabled and enforce_offering_qos are both True "
+                "but qos_paused/qos_downscaled are set — the account-QoS-swap "
+                "pause conflicts with per-association QoS grants. Remove "
+                "qos_paused/qos_downscaled (the enforced path uses an orthogonal "
+                "pause lever) or unset enforce_offering_qos."
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def validate_rest_mode(self) -> SlurmBackendSettingsSchema:
+        """REST execution mode needs connection settings and an explicit cluster."""
+        if self.execution_mode is ExecutionMode.REST:
+            if self.rest_api is None:
+                msg = "execution_mode is 'rest' but rest_api settings are missing"
+                raise ValueError(msg)
+            if not self.cluster_name:
+                msg = (
+                    "execution_mode is 'rest' but cluster_name is not set — REST "
+                    "association payloads require an explicit cluster"
+                )
+                raise ValueError(msg)
+        return self

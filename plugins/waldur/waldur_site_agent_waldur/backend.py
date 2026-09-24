@@ -15,14 +15,15 @@ from waldur_api_client.api.marketplace_provider_resources import (
     marketplace_provider_resources_set_effective_id,
     marketplace_provider_resources_set_end_date,
 )
-from waldur_api_client.api.projects import projects_partial_update, projects_retrieve
+from waldur_api_client.api.projects import projects_partial_update
 from waldur_api_client.models.patched_project_request import PatchedProjectRequest
-from waldur_api_client.models.project_field_enum import ProjectFieldEnum
+from waldur_api_client.models.project import Project
 from waldur_api_client.models.resource_effective_id_request import ResourceEffectiveIDRequest
 from waldur_api_client.models.resource_field_enum import ResourceFieldEnum
 from waldur_api_client.client import AuthenticatedClient
 from waldur_api_client.errors import UnexpectedStatus
 from waldur_api_client.models.observable_object_type_enum import ObservableObjectTypeEnum
+from waldur_api_client.models.oecd_fos_2007_code_enum import OecdFos2007CodeEnum
 from waldur_api_client.models.order_state import OrderState
 from waldur_api_client.models.resource import Resource as WaldurResource
 from waldur_api_client.models.resource_end_date_request import ResourceEndDateRequest
@@ -31,12 +32,13 @@ from waldur_api_client.models.resource_state import ResourceState
 from waldur_api_client.types import UNSET
 
 from waldur_site_agent.backend import backends
+from waldur_site_agent.backend import utils as backend_utils
 from waldur_site_agent.backend.exceptions import BackendError, BackendNotReadyError
 from waldur_site_agent.backend.structures import BackendResourceInfo
 
 from waldur_site_agent_waldur.client import DEFAULT_PROJECT_ROLE_NAME, WaldurClient
 from waldur_site_agent_waldur.component_mapping import ComponentMapper
-from waldur_site_agent_waldur.enums import EndDateSyncDirection
+from waldur_site_agent_waldur.enums import EndDateSyncDirection, LimitSyncDirection
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,11 @@ class WaldurBackend(backends.BaseBackend):
 
     supports_async_orders = True
     supports_cycle_preflight = True
+    requires_source_project = True
+    # Every resource federated from a given source project maps onto the same Waldur B
+    # project (backend_id = "{customer_uuid}_{project_uuid}"), so all resources share
+    # one project membership. See BaseBackend.shared_project_membership.
+    shared_project_membership = True
     handled_resource_states = [ResourceState.OK, ResourceState.ERRED, ResourceState.CREATING]
 
     def __init__(
@@ -80,6 +87,9 @@ class WaldurBackend(backends.BaseBackend):
             backend_settings.get(
                 "end_date_sync_direction", EndDateSyncDirection.BIDIRECTIONAL
             )
+        )
+        self.limit_sync_direction = LimitSyncDirection(
+            backend_settings.get("limit_sync_direction", LimitSyncDirection.B_TO_A)
         )
 
         self.client: WaldurClient = WaldurClient(
@@ -138,8 +148,27 @@ class WaldurBackend(backends.BaseBackend):
             return ""
         return waldur_resource.project_description
 
-    def sync_resource_project(self, waldur_resource: WaldurResource) -> None:
-        """Sync project description from Waldur A to the corresponding project on Waldur B."""
+    def sync_resource_project(
+        self,
+        waldur_resource: WaldurResource,
+        source_project: Optional[Project] = None,
+    ) -> None:
+        """Sync project metadata from Waldur A to the corresponding project on Waldur B.
+
+        Pushes the project description, the OECD FOS 2007 code, the industry flag
+        and the science sub-domain. Only fields that differ on Waldur B are sent.
+
+        ``source_project`` is the Waldur A project pre-fetched by core (see
+        ``requires_source_project``). The OECD/industry/science fields are read
+        from it. When it is ``None`` (fetch failed) only the description, which
+        is carried on the resource, is synced.
+
+        The science sub-domain is per-instance, so it is matched by its
+        portable ``code`` (e.g. ``"1.1"``): the code is read from Waldur A and
+        resolved to Waldur B's own sub-domain UUID. If Waldur B has no
+        sub-domain with that code, the field is left unchanged and a warning is
+        logged.
+        """
         project_uuid = waldur_resource.project_uuid
         customer_uuid = waldur_resource.customer_uuid
 
@@ -147,15 +176,63 @@ class WaldurBackend(backends.BaseBackend):
             return
 
         backend_id = f"{customer_uuid}_{project_uuid}"
-        description = self._get_project_description(waldur_resource)
 
         existing = self.client.find_project_by_backend_id(backend_id)
-        if existing and description and existing.get("description", "") != description:
+        if not existing:
+            return
+
+        changes: dict = {}
+
+        description = self._get_project_description(waldur_resource)
+        if description and existing.get("description", "") != description:
+            changes["description"] = description
+
+        if source_project is not None:
+            a_oecd = source_project.oecd_fos_2007_code
+            if (a_oecd or None) != (existing.get("oecd_fos_2007_code") or None):
+                changes["oecd_fos_2007_code"] = (
+                    a_oecd if isinstance(a_oecd, OecdFos2007CodeEnum) else None
+                )
+            a_is_industry = source_project.is_industry
+            if a_is_industry != existing.get("is_industry"):
+                changes["is_industry"] = a_is_industry
+
+            a_sub_domain_code = source_project.science_sub_domain_code or None
+            b_sub_domain_code = existing.get("science_sub_domain_code") or None
+            if a_sub_domain_code != b_sub_domain_code:
+                if a_sub_domain_code is None:
+                    changes["science_sub_domain"] = None
+                else:
+                    b_sub_domain_uuid = self.client.find_science_sub_domain_by_code(
+                        a_sub_domain_code
+                    )
+                    if b_sub_domain_uuid is not None:
+                        changes["science_sub_domain"] = b_sub_domain_uuid
+                    else:
+                        logger.warning(
+                            "Science sub-domain code %s from project %s not found "
+                            "on Waldur B; skipping science_sub_domain sync for "
+                            "backend_id=%s",
+                            a_sub_domain_code,
+                            project_uuid,
+                            backend_id,
+                        )
+
+        if changes:
             logger.info(
-                "Syncing project description for backend_id=%s",
+                "Syncing project metadata for backend_id=%s (fields: %s)",
                 backend_id,
+                ", ".join(sorted(changes)),
             )
-            self.client.update_project(existing["uuid"], description)
+            try:
+                self.client.update_project(existing["uuid"], **changes)
+            except UnexpectedStatus as e:
+                logger.warning(
+                    "Could not sync project metadata for backend_id=%s (status %s): %s",
+                    backend_id,
+                    e.status_code,
+                    e,
+                )
 
     def _pre_create_resource(
         self,
@@ -435,6 +512,27 @@ class WaldurBackend(backends.BaseBackend):
         )
         return str(order.uuid)
 
+    def sync_resource_limits(
+        self,
+        waldur_resource: WaldurResource,
+        waldur_rest_client: AuthenticatedClient,
+    ) -> None:
+        """Reconcile resource limits between Waldur A and the backend (Waldur B).
+
+        Behavior depends on the ``limit_sync_direction`` setting:
+        - ``"b_to_a"`` (default): Waldur B is the source of truth; pull B's
+          limits into A (the generic reconciliation in ``BaseBackend``).
+        - ``"disabled"``: no reconciliation; limits change only through orders.
+        """
+        if self.limit_sync_direction == LimitSyncDirection.DISABLED:
+            logger.info(
+                "Limit sync disabled for resource %s (%s), skipping",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+            )
+            return
+        super().sync_resource_limits(waldur_resource, waldur_rest_client)
+
     def set_resource_limits(
         self, resource_backend_id: str, limits: dict[str, int]
     ) -> Optional[str]:
@@ -444,6 +542,16 @@ class WaldurBackend(backends.BaseBackend):
             Target order UUID when an update order was submitted on Waldur B.
         """
         target_limits = self.component_mapper.convert_limits_to_target(limits)
+        current_limits = self.client.get_resource_limits(resource_backend_id)
+        if target_limits and all(
+            current_limits.get(key) == value for key, value in target_limits.items()
+        ):
+            logger.info(
+                "Limits for resource %s already in sync on Waldur B (%s), skipping update order",
+                resource_backend_id,
+                target_limits,
+            )
+            return None
         try:
             order_uuid = self.client.create_update_order(
                 resource_uuid=UUID(resource_backend_id),
@@ -637,19 +745,21 @@ class WaldurBackend(backends.BaseBackend):
     def _get_usage_report(
         self, resource_backend_ids: list[str]
     ) -> dict[str, dict[str, dict[str, float]]]:
-        """Pull usage from Waldur B and reverse-convert via ComponentMapper.
+        """Pull current-month usage from Waldur B and reverse-convert via ComponentMapper.
 
-        For each resource:
-        1. Fetch component usages from Waldur B
-        2. Fetch per-user component usages from Waldur B
-        3. Reverse-map target component usage -> source components
-        4. Build report with TOTAL_ACCOUNT_USAGE key
+        The billing period is mandatory: an unfiltered query returns every month
+        Waldur B has ever recorded and sums them into the current one.
         """
+        now = backend_utils.get_current_time_in_timezone(self.timezone)
+        billing_period = datetime.date(now.year, now.month, 1)
+
         report: dict[str, dict[str, dict[str, float]]] = {}
 
         for resource_id in resource_backend_ids:
             try:
-                resource_report = self._get_single_resource_usage(resource_id)
+                resource_report = self._get_single_resource_usage(
+                    resource_id, billing_period=billing_period
+                )
                 report[resource_id] = resource_report
             except Exception:
                 logger.exception("Failed to get usage for resource %s", resource_id)
@@ -986,6 +1096,13 @@ class WaldurBackend(backends.BaseBackend):
                 identity = user_cuids.get(username, username)
                 remote_user_uuid = self._resolve_remote_user(identity)
                 if not remote_user_uuid:
+                    # Deliberately not reported as removed. None here means
+                    # either "no such person on Waldur B" or "the lookup
+                    # failed": every resolver swallows its errors and returns
+                    # None, and the default user_not_found_action only warns.
+                    # Releasing an account because a remote call timed out is
+                    # exactly what the caller's confirmation rule exists to
+                    # prevent, so the account waits for a cycle that can tell.
                     continue
 
                 source_role = user_roles.get(username)
@@ -1305,25 +1422,17 @@ class WaldurBackend(backends.BaseBackend):
                 return
 
             backend_id = waldur_resource.backend_id
-            if isinstance(backend_id, type(UNSET)) or not backend_id:
+            if not backend_id:
                 return
 
             # Extract A's end_date and timestamp
-            a_end_date = waldur_resource.end_date
-            if isinstance(a_end_date, type(UNSET)):
-                a_end_date = None
-            a_updated_at = getattr(waldur_resource, "end_date_updated_at", None)
-            if isinstance(a_updated_at, type(UNSET)):
-                a_updated_at = None
+            a_end_date = waldur_resource.end_date or None
+            a_updated_at = waldur_resource.end_date_updated_at or None
 
             # Fetch B resource
             b_resource = self.client.get_marketplace_resource(UUID(backend_id))
-            b_end_date = b_resource.end_date
-            if isinstance(b_end_date, type(UNSET)):
-                b_end_date = None
-            b_updated_at = getattr(b_resource, "end_date_updated_at", None)
-            if isinstance(b_updated_at, type(UNSET)):
-                b_updated_at = None
+            b_end_date = b_resource.end_date or None
+            b_updated_at = b_resource.end_date_updated_at or None
 
             a_wins = self._decide_end_date_sync_direction(
                 a_end_date, b_end_date, a_updated_at, b_updated_at
@@ -1332,12 +1441,8 @@ class WaldurBackend(backends.BaseBackend):
                 return
 
             # Extract user who requested the end_date change
-            a_requested_by = getattr(waldur_resource, "end_date_requested_by", None)
-            if isinstance(a_requested_by, type(UNSET)):
-                a_requested_by = None
-            b_requested_by = getattr(b_resource, "end_date_requested_by", None)
-            if isinstance(b_requested_by, type(UNSET)):
-                b_requested_by = None
+            a_requested_by = waldur_resource.end_date_requested_by or None
+            b_requested_by = b_resource.end_date_requested_by or None
 
             if a_wins:
                 logger.info(
@@ -1359,16 +1464,19 @@ class WaldurBackend(backends.BaseBackend):
                     client=waldur_rest_client,
                     body=ResourceEndDateRequest(end_date=b_end_date),
                 )
-        except Exception:
-            logger.exception(
-                "Failed to sync end_date for resource %s",
+        except UnexpectedStatus as e:
+            logger.warning(
+                "Could not sync end_date for resource %s (status %s): %s",
                 getattr(waldur_resource, "backend_id", "unknown"),
+                e.status_code,
+                e,
             )
 
     def sync_project_end_date(
         self,
         waldur_resource: WaldurResource,
         waldur_rest_client: AuthenticatedClient,
+        source_project: Optional[Project] = None,
     ) -> None:
         """Sync the project's end_date between Waldur A and Waldur B.
 
@@ -1377,7 +1485,11 @@ class WaldurBackend(backends.BaseBackend):
 
         Args:
             waldur_resource: Resource from Waldur A carrying ``project_end_date``.
-            waldur_rest_client: Authenticated client for the Waldur A API.
+            waldur_rest_client: Authenticated client for the Waldur A API
+                (used to write back to A in the B-to-A direction).
+            source_project: The Waldur A project pre-fetched by core (see
+                ``requires_source_project``); carries ``end_date_updated_at``
+                for the bidirectional last-update-wins comparison.
         """
         try:
             if self.end_date_sync_direction == EndDateSyncDirection.DISABLED:
@@ -1397,19 +1509,13 @@ class WaldurBackend(backends.BaseBackend):
             b_updated_at = b_project.end_date_updated_at or None
 
             # The resource does not carry the project end_date timestamp, so for
-            # bidirectional last-update-wins we read it from the Waldur A project.
+            # bidirectional we read it from the core-fetched source project
             a_updated_at = None
-            if self.end_date_sync_direction == EndDateSyncDirection.BIDIRECTIONAL:
-                a_project = projects_retrieve.sync(
-                    uuid=UUID(str(project_uuid)),
-                    client=waldur_rest_client,
-                    field=[
-                        ProjectFieldEnum.END_DATE,
-                        ProjectFieldEnum.END_DATE_UPDATED_AT,
-                    ],
-                )
-                if a_project:
-                    a_updated_at = a_project.end_date_updated_at or None
+            if (
+                self.end_date_sync_direction == EndDateSyncDirection.BIDIRECTIONAL
+                and source_project is not None
+            ):
+                a_updated_at = source_project.end_date_updated_at or None
 
             a_wins = self._decide_end_date_sync_direction(
                 a_end_date, b_end_date, a_updated_at, b_updated_at
@@ -1474,16 +1580,15 @@ class WaldurBackend(backends.BaseBackend):
             # via entry_point.load(), which re-imports this module. Importing
             # anything that transitively touches common.utils at module level
             # causes a circular import when this plugin is loaded first.
+            import json
+
             from waldur_site_agent.common.agent_identity_management import (
                 AgentIdentityManager,
             )
             from waldur_site_agent.common.structures import Offering
             from waldur_site_agent.common.utils import get_client
-            from waldur_site_agent.event_processing.event_subscription_manager import (
-                WALDUR_LISTENER_NAME,
-            )
             from waldur_site_agent.event_processing.utils import (
-                _setup_single_stomp_subscription,
+                _setup_unified_stomp_connection,
             )
             from waldur_site_agent_waldur.target_event_handler import (
                 make_target_offering_user_handler,
@@ -1531,77 +1636,65 @@ class WaldurBackend(backends.BaseBackend):
                 )
                 return []
 
-            consumers = []
+            # Unified: ONE queue on Waldur B receives ORDER, OFFERING_USER and
+            # RESOURCE, routed to their distinct target handlers by payload
+            # object_type (replacing the former three per-type connections).
+            target_handlers = {
+                ObservableObjectTypeEnum.ORDER.value: make_target_order_handler(
+                    source_offering
+                ),
+                ObservableObjectTypeEnum.OFFERING_USER.value: (
+                    make_target_offering_user_handler(source_offering, self)
+                ),
+                ObservableObjectTypeEnum.RESOURCE.value: (
+                    make_target_resource_end_date_handler(source_offering, self)
+                ),
+            }
 
-            # Set up STOMP subscription for ORDER events
-            order_consumer = _setup_single_stomp_subscription(
+            def target_router(frame, offering, agent, expose_backend_error_details=True):
+                try:
+                    payload = json.loads(frame.body)
+                except (ValueError, TypeError):
+                    logger.exception("Dropping non-JSON target STOMP message")
+                    return
+                handler = target_handlers.get(payload.get("object_type"))
+                if handler is None:
+                    # ack=auto: an unrouted message is gone, so say so loudly.
+                    logger.warning(
+                        "No target handler for object_type %s, dropping",
+                        payload.get("object_type"),
+                    )
+                    return
+                handler(frame, offering, agent, expose_backend_error_details)
+
+            consumer = _setup_unified_stomp_connection(
                 target_offering,
                 agent_identity,
                 agent_identity_manager,
                 user_agent,
-                ObservableObjectTypeEnum.ORDER,
+                [
+                    ObservableObjectTypeEnum.ORDER,
+                    ObservableObjectTypeEnum.OFFERING_USER,
+                    ObservableObjectTypeEnum.RESOURCE,
+                ],
                 global_proxy,
+                on_message_callback=target_router,
             )
-            if order_consumer is not None:
-                connection, event_subscription, _ = order_consumer
-                custom_handler = make_target_order_handler(source_offering)
-                listener = connection.get_listener(WALDUR_LISTENER_NAME)
-                if listener is not None:
-                    listener.on_message_callback = custom_handler
-                consumers.append((connection, event_subscription, target_offering))
-
-            offering_user_consumer = _setup_single_stomp_subscription(
-                target_offering,
-                agent_identity,
-                agent_identity_manager,
-                user_agent,
-                ObservableObjectTypeEnum.OFFERING_USER,
-                global_proxy,
-            )
-            if offering_user_consumer is not None:
-                connection, event_subscription, _ = offering_user_consumer
-                custom_handler = make_target_offering_user_handler(
-                    source_offering, self
-                )
-                listener = connection.get_listener(WALDUR_LISTENER_NAME)
-                if listener is not None:
-                    listener.on_message_callback = custom_handler
-                consumers.append((connection, event_subscription, target_offering))
-
-            # Set up STOMP subscription for RESOURCE events (end_date sync)
-            resource_consumer = _setup_single_stomp_subscription(
-                target_offering,
-                agent_identity,
-                agent_identity_manager,
-                user_agent,
-                ObservableObjectTypeEnum.RESOURCE,
-                global_proxy,
-            )
-            if resource_consumer is not None:
-                connection, event_subscription, _ = resource_consumer
-                custom_handler = make_target_resource_end_date_handler(
-                    source_offering, self
-                )
-                listener = connection.get_listener(WALDUR_LISTENER_NAME)
-                if listener is not None:
-                    listener.on_message_callback = custom_handler
-                consumers.append((connection, event_subscription, target_offering))
-
-            if not consumers:
+            if consumer is None:
                 logger.error(
-                    "Failed to set up target STOMP subscriptions for %s",
+                    "Failed to set up target STOMP subscription for %s",
                     source_offering.name,
                 )
                 return []
 
+            connection, unified_queue, _ = consumer
             logger.info(
-                "Target STOMP subscriptions active for %s -> %s (%d subscriptions)",
+                "Target STOMP subscription active for %s -> %s (queue %s)",
                 source_offering.name,
                 target_offering.name,
-                len(consumers),
+                unified_queue.queue_name,
             )
-
-            return consumers
+            return [(connection, unified_queue, target_offering)]
 
         except Exception:
             logger.exception(

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import os
-
+import threading
 from abc import ABC, abstractmethod
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from waldur_api_client.client import AuthenticatedClient
 from waldur_api_client.models.offering_user import OfferingUser
+from waldur_api_client.models.offering_user_state import OfferingUserState
 from waldur_api_client.models.order_details import OrderDetails
+from waldur_api_client.models.project import Project
 from waldur_api_client.models.resource import Resource as WaldurResource
 from waldur_api_client.models.resource_state import ResourceState
 
@@ -26,6 +28,25 @@ from waldur_site_agent.backend.exceptions import (
 )
 
 UNKNOWN_BACKEND_TYPE = "unknown"
+
+# Per-thread state for the pull in progress. pull_resources sets include_usage
+# here for the duration of one call and the default _pull_backend_resource reads
+# it, so the flag never has to travel through pull_resource /
+# _pull_backend_resource -- whose many plugin overrides keep their signatures.
+# Thread-local rather than instance state: a STOMP subscription runs on its own
+# thread and a thread is synchronous through one pull, so a backend instance
+# reached from two threads can never see the other's flag.
+_PULL_STATE = threading.local()
+
+
+def _pull_include_usage() -> bool:
+    """Whether the pull running on this thread wants the usage report (True outside one)."""
+    return bool(getattr(_PULL_STATE, "include_usage", True))
+
+
+def _pull_strict() -> bool:
+    """Whether the pull running on this thread must fail loudly (False outside one)."""
+    return bool(getattr(_PULL_STATE, "strict", False))
 
 
 class PendingOrderDecision(Enum):
@@ -49,10 +70,66 @@ class BaseBackend(ABC):
     # and calls check_pending_order() to track remote order completion.
     supports_async_orders: bool = False
 
+    # Whether the backend manages resource API keys. The agent — not Waldur — mints
+    # them: it applies a key to the backend first and only then reports the value, so
+    # a key Waldur stores is always one the backend already accepts.
+    #
+    # An implementation provides two methods. Generation takes the resource backend id
+    # and a count, and returns one dict per key with the public "client_id" and the
+    # secret "api_key"; it runs once, at provisioning. Rotation takes the client_id
+    # being rotated, the resource backend id, and the client_ids Waldur currently
+    # holds for that resource. It returns just the new secret when the client_id is a
+    # stable slot, or both halves when the public identifier rotates with it (an S3
+    # access key). The known set lets a backend drop keys Waldur never learned about,
+    # such as the residue of a rotation whose reply was lost; None means unknown, so
+    # nothing is pruned — reading it as empty would delete every live credential.
+    #
+    # There is no revoke: the key count is fixed at provisioning and a rotation
+    # replaces a value in place.
+    supports_resource_api_keys: bool = False
+
     # Capability flag: Set to True for backends that depend on a remote API during
     # order processing. The processor calls run_preflight() once per offering
     # cycle before handling orders.
     supports_cycle_preflight: bool = False
+
+    # Capability flag: Set to True for backends that can create POSIX home
+    # directories for their users. Gates the standalone homedir-creation command
+    # (``create_homedirs_for_offering_users``) so it is driven by what a backend
+    # declares rather than by its backend type. The default implementation of
+    # ``create_user_homedirs`` shells out to the local ``mkhomedir_helper``, which
+    # is meaningless for API-only backends — hence opt-in.
+    supports_user_homedirs: bool = False
+
+    # Capability flag: Set to True for backends that implement
+    # ``apply_periodic_settings`` (periodic usage-policy limits pushed by Waldur).
+    # The default implementation returns an explicit failure result so the caller
+    # always has something to report back to Waldur.
+    supports_periodic_settings: bool = False
+
+    # Capability flag: Set to True for backends that mirror project metadata and
+    # need the full source project. When enabled, the processor pre-fetches the
+    # source project from Waldur and passes it to sync_resource_project so the
+    # plugin never calls Waldur itself.
+    requires_source_project: bool = False
+
+    # Capability flag: Set to True for backends where every resource federated from a
+    # given source project collapses onto one shared backend project (e.g. Waldur-to-
+    # Waldur federation). When enabled, membership sync reconciles against the union of
+    # consented teams across all the project's resources, so a user is kept while they
+    # consent to any offering with a resource in the project instead of being revoked
+    # when a sibling offering's team is synced.
+    shared_project_membership: bool = False
+
+    # How many times to attempt fetching the team for a resource before giving
+    # up.  The retry loop only fires when the team list comes back empty, so it
+    # covers the race where Waldur hasn't yet committed a new membership row.
+    # Set > 1 in backends where that race is common (e.g. Nextcloud via STOMP).
+    # Applied in both order-processing and HTTP-polling paths.
+    team_fetch_attempts: int = 1
+
+    # Seconds to wait between team-fetch retries.  Paired with team_fetch_attempts.
+    team_fetch_delay: float = 3.0
 
     # Resource states the membership processor should fetch and handle.
     # Override in subclasses that need to process resources in additional
@@ -354,35 +431,72 @@ class BaseBackend(ABC):
         homedir_base_path = self.backend_settings.get("homedir_base_path")
 
         for username in usernames:
+            # Skip the (recurrent) homedir creation call when the directory is
+            # already present. Only possible when the base path is configured;
+            # otherwise the path can only be resolved via the password database,
+            # which is not yet populated for a freshly provisioned user.
+            homedir_exists = False
             if homedir_base_path:
-                user_homedir = os.path.join(homedir_base_path, username)
-                if os.path.isdir(user_homedir):
-                    logger.info("Homedir of user %s already exists: %s", username, user_homedir)
-                    continue
+                homedir_exists = (Path(homedir_base_path) / username).is_dir()
 
-            try:
-                logger.info("Creating homedir for the user %s with umask %s", username, umask)
-                self.client.create_linux_user_homedir(username, umask)
-                logger.info("Homedir for user %s has been created", username)
-            except BackendError as err:
-                logger.exception(
-                    "Unable to create user homedir for %s, reason: %s",
-                    username,
-                    err,
-                )
-                continue
+            if homedir_exists:
+                logger.info("Homedir for user %s already exists, skipping creation", username)
+            else:
+                try:
+                    logger.info("Creating homedir for the user %s with umask %s", username, umask)
+                    self.client.create_linux_user_homedir(username, umask)
+                    logger.info("Homedir for user %s has been created", username)
+                except BackendError as err:
+                    logger.exception(
+                        "Unable to create user homedir for %s, reason: %s",
+                        username,
+                        err,
+                    )
+                    continue
 
             if quota_config is not None:
                 try:
                     homedir_path = quota.get_user_homedir(username, homedir_base_path)
-                    quota.apply_homedir_quota(
-                        self.client, username, homedir_path, quota_config
-                    )
+                    quota.apply_homedir_quota(self.client, username, homedir_path, quota_config)
                 except Exception:
                     logger.exception(
                         "Failed to apply homedir quota for %s",
                         username,
                     )
+
+    def apply_periodic_settings(
+        self,
+        resource_id: str,
+        settings: dict,
+        config: Optional[dict] = None,
+    ) -> dict:
+        """Apply periodic usage-policy settings calculated by Waldur.
+
+        Backends that support periodic limits override this method and set
+        ``supports_periodic_settings = True``. The default implementation is a
+        declared no-op that reports failure, so the caller can always relay a
+        definite outcome to Waldur instead of silently dropping the request.
+
+        Args:
+            resource_id: Backend identifier of the resource to apply settings to.
+            settings: Settings calculated by Waldur (fairshare, limits, resets).
+            config: Optional backend-specific configuration override.
+
+        Returns:
+            Result dict with at least a ``success`` key; on failure an ``error``
+            message explaining why.
+        """
+        del settings, config
+        logger.warning(
+            "Backend %s does not support periodic settings, skipping resource %s",
+            type(self).__name__,
+            resource_id,
+        )
+        return {
+            "success": False,
+            "error": f"Backend {type(self).__name__} does not support periodic settings",
+            "commands_executed": [],
+        }
 
     def _get_homedir_quota_config(self) -> quota.HomedirQuotaConfig | None:
         """Parse and return the homedir_quota config, or None if not configured."""
@@ -421,19 +535,86 @@ class BaseBackend(ABC):
         """
 
     def pull_resources(
-        self, waldur_resources: list[WaldurResource]
+        self,
+        waldur_resources: list[WaldurResource],
+        include_usage: bool = True,
+        strict: bool = False,
     ) -> dict[str, tuple[WaldurResource, structures.BackendResourceInfo]]:
-        """Pull data of resources available in the backend."""
+        """Pull data of resources available in the backend.
+
+        ``include_usage=False`` skips the usage report: membership sync never
+        reads it, and a failing report (an accounting query the execution mode
+        cannot serve, a slow slurmdbd) used to drop the resource from the report
+        and silently skip the membership change. The flag is thread-local for
+        the duration of this call (see ``_PULL_STATE``) rather than threaded
+        through ``pull_resource`` / ``_pull_backend_resource``, so the many
+        plugin overrides of those two keep their signatures and their own
+        behaviour; only the default ``_pull_backend_resource`` honours it.
+
+        ``strict=True`` raises instead of dropping a resource that could not be
+        pulled. A caller that decides something by *absence* -- the teardown
+        reads "not in the report" as "the user has no association there" --
+        cannot tell a failed pull from an empty one, and would acknowledge a
+        deletion while the association is still live. Such callers ask for the
+        whole report or none of it, and retry on the next cycle.
+
+        Like ``include_usage`` it is thread-local rather than a parameter of
+        ``pull_resource``: the default ``pull_resource`` catches everything and
+        returns None, so a failure never reaches the loop below and the flag has
+        to be readable from inside that except. A resource the backend simply
+        does not have still drops out quietly -- that is a real absence, and the
+        only thing a strict caller wanted distinguished from it is a failure.
+        """
         report = {}
-        for waldur_resource in waldur_resources:
-            backend_id = waldur_resource.backend_id
-            try:
-                backend_resource_info = self.pull_resource(waldur_resource)
-                if backend_resource_info is not None:
-                    report[backend_id] = (waldur_resource, backend_resource_info)
-            except Exception as e:
-                logger.exception("Error while pulling resource [%s]: %s", backend_id, e)
+        previous = _pull_include_usage()
+        previous_strict = _pull_strict()
+        _PULL_STATE.include_usage = include_usage
+        _PULL_STATE.strict = strict
+        try:
+            for waldur_resource in waldur_resources:
+                backend_id = waldur_resource.backend_id
+                try:
+                    backend_resource_info = self.pull_resource(waldur_resource)
+                    if backend_resource_info is not None:
+                        report[backend_id] = (waldur_resource, backend_resource_info)
+                except Exception as e:
+                    if strict:
+                        msg = f"Unable to pull resource {backend_id}: {e}"
+                        raise BackendError(msg) from e
+                    logger.exception("Error while pulling resource [%s]: %s", backend_id, e)
+        finally:
+            _PULL_STATE.include_usage = previous
+            _PULL_STATE.strict = previous_strict
         return report
+
+    def get_membership_sync_report(
+        self,
+        waldur_resource: WaldurResource,  # noqa: ARG002
+    ) -> Optional[list[dict]]:
+        """Per-grant sync states for the resource, or None when unsupported.
+
+        Backends that can confirm which role grants actually landed on
+        the provider side (e.g. the rancher-kc-crd plugin reading CR
+        status) return a list of entries shaped for the Waldur
+        ``set_membership_sync_statuses`` endpoint:
+        ``{username, scope_type, resource_project_uuid?, role_name,
+        state, message?}``. The membership processor posts the report
+        after each resource sync when the offering opted in via the
+        ``enable_membership_sync_status`` plugin option. Returning None
+        (the default) keeps the backend silent.
+        """
+        return None
+
+    def strict_pull_requested(self) -> bool:
+        """Whether the pull running right now asked to fail loudly.
+
+        An override of ``pull_resource`` that catches its own errors has to
+        consult this and re-raise. Returning None instead tells a strict caller
+        "this resource has no users", which is the ambiguity the flag exists to
+        remove -- and for the teardown path it means releasing an account whose
+        association is still live.
+        """
+        return _pull_strict()
 
     def pull_resource(
         self, waldur_resource: WaldurResource
@@ -447,8 +628,14 @@ class BaseBackend(ABC):
             backend_resource_info = self._pull_backend_resource(backend_id)
             if backend_resource_info is None:
                 return None
-        except Exception as e:
-            logger.exception("Error while pulling resource [%s]: %s", backend_id, e)
+        except Exception:
+            if _pull_strict():
+                # This except is what made absence ambiguous: the resource left
+                # the report whether the backend said "no such resource" or
+                # "I could not answer". Only the second is an error, and for a
+                # caller deciding by absence it has to travel.
+                raise
+            logger.exception("Error while pulling resource [%s]", backend_id)
             return None
         else:
             return backend_resource_info
@@ -486,7 +673,11 @@ class BaseBackend(ABC):
     def _pull_backend_resource(
         self, resource_backend_id: str
     ) -> Optional[structures.BackendResourceInfo]:
-        """Pull resource data from the backend."""
+        """Pull resource data from the backend.
+
+        The usage report is skipped while ``pull_resources(..., include_usage=False)``
+        is running; see there.
+        """
         logger.info("Pulling resource %s", resource_backend_id)
         resource_backend_info = self.client.get_resource(resource_backend_id)
 
@@ -496,7 +687,7 @@ class BaseBackend(ABC):
 
         users = self.client.list_resource_users(resource_backend_id)
 
-        report = self._get_usage_report([resource_backend_id])
+        report = self._get_usage_report([resource_backend_id]) if _pull_include_usage() else {}
         usage = report.get(resource_backend_id)
 
         if usage is None:
@@ -532,13 +723,30 @@ class BaseBackend(ABC):
         self,
         waldur_resource: WaldurResource,
         waldur_rest_client: AuthenticatedClient,
+        source_project: Optional[Project] = None,
     ) -> None:
         """Sync the project's end_date between source and target systems.
 
         No-op by default. Override in backends that manage project end_date
-        synchronization (e.g., Waldur-to-Waldur federation).
+        synchronization (e.g., Waldur-to-Waldur federation). ``source_project``
+        is the source project pre-fetched by core (see ``requires_source_project``).
         """
-        del waldur_resource, waldur_rest_client
+        del waldur_resource, waldur_rest_client, source_project
+
+    def sync_resource_limits(
+        self,
+        waldur_resource: WaldurResource,
+        waldur_rest_client: AuthenticatedClient,
+    ) -> None:
+        """Reconcile the resource limits between the backend and Waldur.
+
+        Default: the backend is the source of truth; pull its limits into the
+        Waldur resource. Override in backends that manage limits differently
+        (e.g. Waldur federation, which can disable this via ``limit_sync_direction``).
+        """
+        from waldur_site_agent.common.utils import sync_waldur_resource_limits  # noqa: PLC0415
+
+        sync_waldur_resource_limits(self, waldur_rest_client, waldur_resource)
 
     def sync_resource_effective_id(
         self,
@@ -693,9 +901,7 @@ class BaseBackend(ABC):
         resource_backend_id = self._get_resource_backend_id(waldur_resource.slug)
 
         # Create resource with generated ID
-        return self.create_resource_with_id(
-            waldur_resource, resource_backend_id, user_context
-        )
+        return self.create_resource_with_id(waldur_resource, resource_backend_id, user_context)
 
     @abstractmethod
     def _pre_create_resource(
@@ -764,9 +970,7 @@ class BaseBackend(ABC):
         )
 
         # Actions after resource creation
-        self.post_create_resource(
-            backend_resource_info, waldur_resource, user_context
-        )
+        self.post_create_resource(backend_resource_info, waldur_resource, user_context)
         return backend_resource_info
 
     def _setup_resource_limits(
@@ -849,9 +1053,7 @@ class BaseBackend(ABC):
 
         return added_users
 
-    def add_user(
-        self, waldur_resource: WaldurResource, username: str, **kwargs: str
-    ) -> bool:
+    def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
         """Add association between user and backend resource if it doesn't exists."""
         del kwargs  # Used by subclass overrides (e.g. WaldurBackend for role_name)
         resource_backend_id = waldur_resource.backend_id
@@ -883,7 +1085,15 @@ class BaseBackend(ABC):
     def remove_users_from_resource(
         self, waldur_resource: WaldurResource, usernames: set[str], **kwargs: dict
     ) -> list[str]:
-        """Remove specified users from the resource on the backend."""
+        """Remove specified users from the resource on the backend.
+
+        Returns the usernames that are no longer associated with the resource:
+        those removed here, plus any a backend knows were never associated at
+        all. A name left out is one the caller must treat as still associated --
+        core releases a departed account only against this list, so the per-user
+        failure swallowed below (deliberately: one bad user must not stop the
+        rest) keeps that account until a later cycle removes it for real.
+        """
         del kwargs
         resource_backend_id = waldur_resource.backend_id
         if len(usernames) < 1:
@@ -923,10 +1133,16 @@ class BaseBackend(ABC):
         """
         del resource_backend_id, username
 
-    def remove_user(
-        self, waldur_resource: WaldurResource, username: str, **kwargs: str
-    ) -> bool:
-        """Delete association between user and backend resource if it exists."""
+    def remove_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
+        """Delete association between user and backend resource if it exists.
+
+        Contract for overrides: return True when an association was removed and
+        False when there was nothing to remove (no association, user unknown to
+        the backend, nothing to re-sync). A removal that was attempted and
+        failed must **raise** BackendError -- callers treat False as benign, so
+        a failure folded into it would let core acknowledge a deletion while the
+        association still exists.
+        """
         del kwargs  # Used by subclass overrides (e.g. WaldurBackend for role_name)
         resource_backend_id = waldur_resource.backend_id
         if not resource_backend_id.strip():
@@ -935,14 +1151,18 @@ class BaseBackend(ABC):
 
         logger.info("Removing user %s from resource %s", username, resource_backend_id)
 
-        if self.client.get_association(username, resource_backend_id):
-            logger.info("Deleting association between %s and %s", username, resource_backend_id)
-            try:
-                self._pre_delete_user_actions(resource_backend_id, username)
-                self.client.delete_association(username, resource_backend_id)
-            except BackendError as err:
-                logger.exception("Unable to delete association in the backend: %s", err)
-                return False
+        if not self.client.get_association(username, resource_backend_id):
+            return False
+        logger.info("Deleting association between %s and %s", username, resource_backend_id)
+        try:
+            self._pre_delete_user_actions(resource_backend_id, username)
+            self.client.delete_association(username, resource_backend_id)
+        except BackendError as err:
+            msg = (
+                f"Unable to delete association between {username} and "
+                f"{resource_backend_id}: {err}"
+            )
+            raise BackendError(msg) from err
         return True
 
     def update_user_attributes(self, username: str, attributes: dict) -> None:
@@ -977,13 +1197,23 @@ class BaseBackend(ABC):
         del waldur_a_offering_uuid, waldur_rest_client
         return False
 
-    def sync_resource_project(self, waldur_resource: WaldurResource) -> None:
+    def sync_resource_project(
+        self,
+        waldur_resource: WaldurResource,
+        source_project: Optional[Project] = None,
+    ) -> None:
         """Sync project metadata (e.g. description) from Waldur to the backend.
 
         Called once per resource during membership sync. Override in backends
         that manage their own projects (e.g., Waldur federation). Default: no-op.
+
+        ``source_project`` is the pre-fetched source project, supplied by core
+        when ``requires_source_project`` is True so overrides can read project
+        fields not carried on the resource (e.g. OECD FOS code, industry flag)
+        without calling Waldur themselves. ``None`` when not needed or the fetch
+        failed.
         """
-        del waldur_resource
+        del waldur_resource, source_project
 
     def process_existing_users(self, existing_users: set[str]) -> None:
         """Process existing users on the backend.
@@ -1049,6 +1279,19 @@ class BaseBackend(ABC):
         )
         self.client.set_resource_user_limits(resource_backend_id, username, limits)
 
+    def prune_unknown_resource_keys(self, resource_backend_id: str, keep: list[str]) -> None:
+        """Drop the resource's backend keys that Waldur does not hold.
+
+        Called at provisioning, before any key is minted, and only with a known set
+        the caller could actually read — ``None`` there means unknown, and nothing
+        is pruned rather than everything.
+
+        A backend whose keys only ever exist because it just made them has no
+        residue to clear, so the default does nothing. Not abstract for that reason:
+        implementing it is the exception, not the contract.
+        """
+        del resource_backend_id, keep
+
     def _get_resource_backend_id(self, resource_slug: str, prefix: str = "") -> str:
         prefix = self.backend_settings.get("allocation_prefix", "")
         return f"{prefix}{resource_slug}".lower()
@@ -1063,10 +1306,18 @@ class BaseBackend(ABC):
 class UnknownBackend(BaseBackend):
     """Common class for unknown backends."""
 
-    def __init__(self) -> None:
-        """Placeholder."""
+    def __init__(self, requested_backend_type: str = "") -> None:
+        """Placeholder.
+
+        ``requested_backend_type`` is the backend the offering asked for, when
+        it asked for one at all. An offering with no membership backend
+        configured is a supported configuration -- Waldur mints the usernames
+        and there are no associations to manage -- not a misconfiguration, and
+        the difference decides whether this backend may refuse to answer.
+        """
         super().__init__({}, {})
         self.backend_type = UNKNOWN_BACKEND_TYPE
+        self.requested_backend_type = requested_backend_type
 
     def ping(self, _: bool = False) -> bool:
         """Placeholder."""
@@ -1088,9 +1339,30 @@ class UnknownBackend(BaseBackend):
         """Placeholder."""
 
     def pull_resources(
-        self, _: list[WaldurResource]
+        self,
+        waldur_resources: list[WaldurResource],
+        include_usage: bool = True,
+        strict: bool = False,
     ) -> dict[str, tuple[WaldurResource, structures.BackendResourceInfo]]:
-        """Placeholder."""
+        """Placeholder that refuses to answer for a plugin that should have loaded.
+
+        An empty report reads as "none of these resources lists any user", and
+        that is what the teardown path uses to decide an account is safe to
+        release. A backend the offering asked for but that did not load must not
+        be able to produce that answer, so a strict caller gets an error.
+
+        An offering that asked for no membership backend is the opposite case:
+        there are no agent-managed associations, the empty report is the honest
+        answer, and refusing it would strand every teardown on that offering
+        forever. Nothing to pull is likewise nothing to be wrong about.
+        """
+        del include_usage
+        if strict and waldur_resources and self.requested_backend_type:
+            msg = (
+                f"Unable to pull {len(waldur_resources)} resource(s): the "
+                f"{self.requested_backend_type} backend of this offering did not load"
+            )
+            raise BackendError(msg)
         return {}
 
     def delete_resource(
@@ -1152,6 +1424,29 @@ class UnknownBackend(BaseBackend):
         return {}
 
 
+#: States in which Waldur is asking the provider to tear an account down. An
+#: offering user lands here when the person leaves their last project on the
+#: offering (with ``offering_user_auto_deletion`` on) or when deletion is
+#: requested by hand; DELETED itself is the provider's acknowledgement.
+DEPARTED_OFFERING_USER_STATES: tuple[OfferingUserState, ...] = (
+    OfferingUserState.REQUESTED_DELETION,
+    OfferingUserState.DELETING,
+    OfferingUserState.ERROR_DELETING,
+)
+
+#: States in which an offering user still holds, or is about to hold, an
+#: account: everything but the deletion states and DELETED. Mirrors the list
+#: Waldur itself uses to decide whether a provider-wide account is still read
+#: through by anything.
+LIVE_OFFERING_USER_STATES: tuple[OfferingUserState, ...] = (
+    OfferingUserState.OK,
+    OfferingUserState.REQUESTED,
+    OfferingUserState.CREATING,
+    OfferingUserState.ERROR_CREATING,
+    OfferingUserState.PENDING_ACCOUNT_LINKING,
+    OfferingUserState.PENDING_ADDITIONAL_VALIDATION,
+)
+
 
 class AbstractUsernameManagementBackend(ABC):
     """Base class for username management backends.
@@ -1168,6 +1463,13 @@ class AbstractUsernameManagementBackend(ABC):
     Both exceptions support an optional comment_url parameter to provide
     users with links to forms, documentation, or other resources.
     """
+
+    #: Whether this backend mints usernames itself and therefore owns the value
+    #: written back to Waldur. Backends for which Waldur is the source of truth
+    #: report False; core then skips username generation (and the write-back)
+    #: entirely rather than asking the backend for a name it does not own.
+    #: Override as a property when one backend class serves both directions.
+    is_username_authoritative: bool = True
 
     def __init__(
         self,
@@ -1223,6 +1525,27 @@ class AbstractUsernameManagementBackend(ABC):
         external systems. Default: no-op.
         """
         del usernames
+
+    def release_users(
+        self,
+        offering_users: list[OfferingUser],
+        waldur_rest_client: AuthenticatedClient,
+    ) -> None:
+        """Release the accounts behind offering users whose access has ended.
+
+        Core calls this in two situations, always *after* the resource backend
+        has dropped the users' associations: for the offering users whose
+        usernames it just removed from a resource, and on every membership cycle
+        for the offering users Waldur has moved into a deletion state
+        (requested deletion, deleting, error deleting).
+
+        Neither call means the person is gone from the *system*: they may still
+        hold another project on this offering, or an account on a sibling
+        offering that shares the same directory. The backend owns that decision
+        and is handed the client so it can ask Waldur. Default: no-op, and core
+        skips the Waldur round-trips entirely for backends that leave it so.
+        """
+        del offering_users, waldur_rest_client
 
 
 class UnknownUsernameManagementBackend(AbstractUsernameManagementBackend):

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import email
 import functools
 import logging
@@ -40,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from ldap3 import ALL, SUBTREE, Connection, Server
+from ldap3 import ALL, MODIFY_REPLACE, SUBTREE, Connection, Server
 from waldur_api_client.api.marketplace_component_usages import (
     marketplace_component_usages_list,
 )
@@ -57,6 +58,7 @@ from waldur_api_client.api.marketplace_provider_resources import (
 from waldur_api_client.models.offering_user_state import OfferingUserState
 from waldur_api_client.models.order_state import OrderState
 from waldur_api_client.types import UNSET
+from waldur_site_agent_ldap_client import LdapClient
 from waldur_site_agent_slurm.backend import SlurmBackend
 
 from plugins.slurm.tests.e2e.conftest import (
@@ -75,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 E2E_TESTS = os.environ.get("WALDUR_E2E_TESTS", "false").lower() == "true"
 E2E_LDAP_CONFIG_PATH = os.environ.get("WALDUR_E2E_LDAP_CONFIG", "")
+E2E_LDAP_INVERTED_CONFIG_PATH = os.environ.get("WALDUR_E2E_LDAP_INVERTED_CONFIG", "")
 E2E_PROJECT_A_UUID = os.environ.get("WALDUR_E2E_PROJECT_A_UUID", "")
 
 # UUID pattern for sanitising diagram labels
@@ -463,6 +466,7 @@ class LdapAssertions:
                     "cn",
                     "mail",
                     "loginShell",
+                    "homeDirectory",
                 ],
             )
             assert len(conn.entries) == 1, (
@@ -1879,3 +1883,416 @@ class TestLdapBackwardCompat:
         back = mapper.convert_usage_from_target({"cpu": 640, "gpu": 80})
         assert back == {"node_hours": 20.0}
         logger.info("Conversion mapper verified: node_hours <-> cpu+gpu")
+
+
+# ---------------------------------------------------------------------------
+# Waldur-authoritative mode (account_source: "waldur")
+# ---------------------------------------------------------------------------
+#
+# The fixture seeds two offerings of ONE service provider sharing its POSIX ID
+# pool, and gives user e2euser4 the same username and the same uidNumber on
+# both. That is the case this mode exists for: pointed at one directory, the two
+# offerings must converge on a single entry instead of each allocating its own
+# id, which is what the legacy allocator does.
+
+_INVERTED_UID = 9001
+_INVERTED_GID = 9001
+_INVERTED_USER = "wauser4"
+_SECOND_USER = "wauser5"
+_SECOND_UID = 9002
+_PROVIDER_OFFERINGS = 2
+
+
+@pytest.fixture(scope="module")
+def inverted_config():
+    if not E2E_LDAP_INVERTED_CONFIG_PATH:
+        pytest.skip("WALDUR_E2E_LDAP_INVERTED_CONFIG not set")
+    return load_configuration(
+        E2E_LDAP_INVERTED_CONFIG_PATH,
+        user_agent_suffix="e2e-ldap-inverted-test",
+    )
+
+
+@pytest.fixture(scope="module")
+def inverted_offerings(inverted_config):
+    if len(inverted_config.offerings) < _PROVIDER_OFFERINGS:
+        pytest.skip("Inverted config must declare both provider offerings")
+    return inverted_config.offerings[0], inverted_config.offerings[1]
+
+
+@pytest.fixture(scope="module")
+def inverted_ldap_settings(inverted_offerings):
+    settings = inverted_offerings[0].backend_settings.get("ldap", {})
+    if not settings:
+        pytest.skip("No LDAP settings in the inverted offering")
+    return settings
+
+
+@pytest.fixture(scope="module")
+def inverted_assertions(inverted_ldap_settings):
+    return LdapAssertions(inverted_ldap_settings)
+
+
+@pytest.fixture(scope="module")
+def inverted_client(inverted_offerings):
+    offering = inverted_offerings[0]
+    return get_client(offering.waldur_api_url, offering.waldur_api_token)
+
+
+def _inverted_connect(settings: dict) -> Connection:
+    server = Server(settings["uri"], get_info=ALL)
+    return Connection(server, settings["bind_dn"], settings["bind_password"], auto_bind=True)
+
+
+def _set_uid_number(settings: dict, username: str, value: int) -> None:
+    """Force a uidNumber straight into the directory, behind the agent's back."""
+    dn = f"uid={username},{settings.get('people_ou', 'ou=People')},{settings['base_dn']}"
+    conn = _inverted_connect(settings)
+    try:
+        assert conn.modify(dn, {"uidNumber": [(MODIFY_REPLACE, [str(value)])]}), (
+            f"Failed to set uidNumber on {dn}: {conn.result}"
+        )
+    finally:
+        conn.unbind()
+
+
+def _reconcile(offering, client, *, on_posix_mismatch: str | None = None) -> None:
+    """Drive one reconcile cycle through the public membership-sync path.
+
+    ``process_project_user_sync`` calls ``sync_user_profiles`` with the full
+    offering-user list unconditionally, so this needs no resource to exist.
+    """
+    if on_posix_mismatch is not None:
+        offering = copy.deepcopy(offering)
+        offering.backend_settings["ldap"]["on_posix_mismatch"] = on_posix_mismatch
+    backend = SlurmBackend(offering.backend_settings, offering.backend_components)
+    processor = OfferingMembershipProcessor(
+        offering=offering,
+        waldur_rest_client=client,
+        resource_backend=backend,
+    )
+    processor.process_project_user_sync(E2E_PROJECT_A_UUID)
+
+
+@pytest.mark.skipif(not E2E_TESTS, reason="E2E tests not enabled")
+class TestLdapWaldurAuthoritative:
+    """account_source: "waldur" — the directory follows Waldur, not the reverse."""
+
+    def test_01_entry_matches_waldur(
+        self, inverted_offerings, inverted_client, inverted_assertions
+    ):
+        """A reconcile writes Waldur's username and POSIX ids into the directory."""
+        offering_a, _ = inverted_offerings
+        _reconcile(offering_a, inverted_client)
+
+        entry = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        assert int(entry["uidNumber"][0]) == _INVERTED_UID
+        assert int(entry["gidNumber"][0]) == _INVERTED_GID
+        assert entry["homeDirectory"][0] == f"/home/{_INVERTED_USER}"
+        assert entry["loginShell"][0] == "/bin/bash"
+
+        # The personal group carries the primary GID Waldur allocated, not one
+        # scanned out of the directory's own gid_range.
+        group = inverted_assertions.assert_group_exists(_INVERTED_USER)
+        assert int(group["gidNumber"][0]) == _INVERTED_GID
+
+        # The offering's second account is provisioned in the same pass.
+        second = inverted_assertions.assert_user_exists(_SECOND_USER)
+        assert int(second["uidNumber"][0]) == _SECOND_UID
+
+    def test_02_second_offering_converges(
+        self, inverted_offerings, inverted_client, inverted_assertions
+    ):
+        """The provider's other offering reuses the entry rather than making its own."""
+        _, offering_b = inverted_offerings
+        _reconcile(offering_b, inverted_client)
+
+        # assert_user_exists already fails on anything other than exactly one
+        # entry, which is the assertion that matters here.
+        entry = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        assert int(entry["uidNumber"][0]) == _INVERTED_UID, (
+            "The second offering must not re-allocate a UID for a shared user"
+        )
+
+    def test_03_rerun_is_idempotent(self, inverted_offerings, inverted_client, inverted_assertions):
+        """A second pass over an already-correct directory changes nothing."""
+        offering_a, _ = inverted_offerings
+        before = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        _reconcile(offering_a, inverted_client)
+        after = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        assert before == after
+
+    def test_04_drift_in_report_mode_changes_nothing(
+        self, inverted_offerings, inverted_client, inverted_assertions, inverted_ldap_settings
+    ):
+        """`report` names the drift and leaves the account alone."""
+        offering_a, _ = inverted_offerings
+        drifted = 9500
+        _set_uid_number(inverted_ldap_settings, _INVERTED_USER, drifted)
+
+        _reconcile(offering_a, inverted_client, on_posix_mismatch="report")
+
+        entry = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        assert int(entry["uidNumber"][0]) == drifted, (
+            "report mode must not rewrite a live uidNumber - doing so orphans "
+            "every file the user owns"
+        )
+
+    def test_05_drift_in_adopt_mode_is_repaired(
+        self, inverted_offerings, inverted_client, inverted_assertions
+    ):
+        """`adopt` brings the drifted account back to Waldur's value."""
+        offering_a, _ = inverted_offerings
+        _reconcile(offering_a, inverted_client, on_posix_mismatch="adopt")
+
+        entry = inverted_assertions.assert_user_exists(_INVERTED_USER)
+        assert int(entry["uidNumber"][0]) == _INVERTED_UID
+
+    def test_06_entry_parked_after_last_access_is_lost(
+        self, inverted_offerings, inverted_client, inverted_assertions
+    ):
+        """Leaving the last project parks the shared entry -- but only once.
+
+        Both offerings hold an account for the same person under one username.
+        Waldur moves each to Requested deletion when the project role goes
+        (``offering_user_auto_deletion`` is on for both in the seed). The first
+        offering's sweep must find no live sibling and disable the entry (the
+        mode's default ``on_departure``): no-login shell, ``shadowExpire`` in the
+        past, the agent's marker -- with the DN, uid and personal group kept, so
+        the identity stays reserved while files owned by it exist. The second
+        offering's sweep must find the entry already parked and only acknowledge.
+        The other seeded account, which nobody removed, is untouched throughout.
+        """
+        offering_a, offering_b = inverted_offerings
+        inverted_assertions.assert_user_exists(_INVERTED_USER)
+
+        _set_inverted_project_member(inverted_client, _INVERTED_USER_UUID, member=False)
+        try:
+            for offering in (offering_a, offering_b):
+                _wait_inverted_offering_user_state(
+                    inverted_client, offering.uuid, _INVERTED_USER_UUID, "Requested deletion"
+                )
+
+            # First offering: the sweep sees only deletion-state siblings and acts.
+            _release_sweep(offering_a)
+            _assert_parked(inverted_assertions, _INVERTED_USER, _INVERTED_UID)
+            assert (
+                _inverted_offering_user_state(
+                    inverted_client, offering_a.uuid, _INVERTED_USER_UUID
+                )
+                == "Deleted"
+            )
+            # The second offering's account is still waiting on its own agent.
+            assert (
+                _inverted_offering_user_state(
+                    inverted_client, offering_b.uuid, _INVERTED_USER_UUID
+                )
+                == "Requested deletion"
+            )
+
+            # Second offering: already parked, only the acknowledgement.
+            _release_sweep(offering_b)
+            _assert_parked(inverted_assertions, _INVERTED_USER, _INVERTED_UID)
+            assert (
+                _inverted_offering_user_state(
+                    inverted_client, offering_b.uuid, _INVERTED_USER_UUID
+                )
+                == "Deleted"
+            )
+
+            # The account nobody removed is exactly as it was.
+            second = inverted_assertions.assert_user_exists(_SECOND_USER)
+            assert int(second["uidNumber"][0]) == _SECOND_UID
+            assert second["loginShell"][0] == "/bin/bash"
+        finally:
+            # Put the membership back so later modules see the seeded team.
+            _set_inverted_project_member(inverted_client, _INVERTED_USER_UUID, member=True)
+
+    def test_07_returning_user_gets_the_same_entry_back(
+        self, inverted_offerings, inverted_client, inverted_assertions, inverted_ldap_settings
+    ):
+        """A person who regains access is re-enabled on the same DN and uid.
+
+        Waldur re-mints the same username (it derives from the pool uid, and
+        the provider account keeps the uid), so the reconcile sees a live
+        offering user whose entry exists but is parked -- and must wake it
+        instead of failing on UID_TAKEN or "entry exists".
+
+        The directory side is exercised on the second seeded account: its
+        entry is parked exactly as test_06 parked the first one, while its
+        offering user stays live in Waldur. Waldur's own Deleted -> Requested
+        restore cannot be produced in this fixture: it fires only on a rejoin
+        to a project holding a resource of an offering with
+        ``service_provider_can_create_offering_user``, and there is no API to
+        request it by hand.
+        """
+        offering_a, _ = inverted_offerings
+        before = inverted_assertions.assert_user_exists(_SECOND_USER)
+        LdapClient(inverted_ldap_settings).disable_user(_SECOND_USER)
+        _assert_parked(inverted_assertions, _SECOND_USER, _SECOND_UID)
+
+        _reconcile(offering_a, inverted_client)
+
+        entry = inverted_assertions.assert_user_exists(_SECOND_USER)
+        assert int(entry["uidNumber"][0]) == _SECOND_UID
+        assert entry["loginShell"][0] == before["loginShell"][0]
+        assert not entry.get("shadowExpire")
+        assert _DISABLED_MARKER not in (entry.get("description") or [])
+        group = inverted_assertions.assert_group_exists(_SECOND_USER)
+        assert int(group["gidNumber"][0]) == int(before["gidNumber"][0])
+
+    def test_08_a_teardown_that_cannot_finish_is_not_acknowledged(
+        self, inverted_offerings, inverted_client, inverted_assertions
+    ):
+        """Two ways a release fails, then the retry that finally completes it.
+
+        A release that could not finish must not end as Deleted. Whichever half
+        broke, telling Waldur the account is gone would leave the person's
+        access standing under a name nothing tracks any more -- and nothing
+        would look again, because the sweep only revisits accounts Waldur still
+        lists as departing.
+
+        Both faults share one departure on purpose. Waldur does not walk a
+        Deleted offering user back to a live state when the member returns, so
+        a second test could never obtain its own "Requested deletion" after
+        this one completes the teardown.
+
+        The subject is the account held on ONE offering: were it the shared
+        one, a live sibling on the other offering would keep the entry for its
+        own reasons and every assertion here would pass without the injected
+        fault mattering at all.
+        """
+        from unittest import mock  # noqa: PLC0415
+
+        from waldur_site_agent.backend.exceptions import BackendError  # noqa: PLC0415
+
+        offering_a, _ = inverted_offerings
+        before = inverted_assertions.assert_user_exists(_SECOND_USER)
+        assert before["loginShell"][0] == "/bin/bash", "precondition: the entry is live"
+
+        def assert_not_torn_down(why: str) -> None:
+            state = _inverted_offering_user_state(
+                inverted_client, offering_a.uuid, _SECOND_USER_UUID
+            )
+            assert state != "Deleted", f"{why}: acknowledged anyway (state {state})"
+            kept = inverted_assertions.assert_user_exists(_SECOND_USER)
+            assert kept["loginShell"][0] == "/bin/bash", f"{why}: the entry was parked"
+
+        _set_inverted_project_member(inverted_client, _SECOND_USER_UUID, member=False)
+        try:
+            _wait_inverted_offering_user_state(
+                inverted_client, offering_a.uuid, _SECOND_USER_UUID, "Requested deletion"
+            )
+
+            # A resource that could not be pulled is not a resource with no
+            # users: a failed pull yields the same empty report as an empty one.
+            with mock.patch.object(
+                SlurmBackend,
+                "pull_resources",
+                side_effect=BackendError("slurmdbd did not answer"),
+            ):
+                _release_sweep(offering_a)
+            assert_not_torn_down("the teardown ran on a report it could not trust")
+
+            # A directory whose groups cannot be read -- a wrong groups_ou, or a
+            # bind that lost its rights -- cannot know what still grants access.
+            with mock.patch.object(
+                LdapClient,
+                "find_group_memberships",
+                side_effect=BackendError("ou=Groups,dc=sofiatech,dc=bg does not exist"),
+            ):
+                _release_sweep(offering_a)
+            assert_not_torn_down("the groups could not be read")
+
+            # The retry: the same sweep, with both answering normally.
+            _release_sweep(offering_a)
+            _assert_parked(inverted_assertions, _SECOND_USER, _SECOND_UID)
+            assert (
+                _inverted_offering_user_state(inverted_client, offering_a.uuid, _SECOND_USER_UUID)
+                == "Deleted"
+            )
+        finally:
+            _set_inverted_project_member(inverted_client, _SECOND_USER_UUID, member=True)
+
+
+_INVERTED_USER_UUID = "e2ea0000000000000000000000000005"
+# The account held on offering A only: one sweep decides its fate, with no live
+# sibling to keep the entry for unrelated reasons.
+_SECOND_USER_UUID = "e2ea0000000000000000000000000006"
+_DISABLED_MARKER = "waldur-site-agent:disabled"
+
+
+def _assert_parked(assertions: LdapAssertions, username: str, uid: int) -> dict:
+    """The entry exists with its ids, and carries every disable marker."""
+    conn = assertions._connect()
+    try:
+        conn.search(
+            assertions.people_dn,
+            f"(uid={username})",
+            search_scope=SUBTREE,
+            attributes=["uidNumber", "loginShell", "shadowExpire", "description", "objectClass"],
+        )
+        assert len(conn.entries) == 1, f"Expected uid={username} to still exist"
+        entry = conn.entries[0].entry_attributes_as_dict
+    finally:
+        conn.unbind()
+    assert int(entry["uidNumber"][0]) == uid, "a parked entry keeps its uid"
+    assert entry["loginShell"][0] == "/usr/sbin/nologin"
+    assert str(entry["shadowExpire"][0]) == "1"
+    assert "shadowAccount" in entry["objectClass"]
+    assert _DISABLED_MARKER in entry["description"]
+    assertions.assert_group_exists(username)
+    return entry
+
+
+_INVERTED_MEMBER_ROLE = "PROJECT.MEMBER"
+_INVERTED_STATE_TIMEOUT = 90
+
+
+def _release_sweep(offering) -> None:
+    """Run the periodic username-backend reconciliation once for one offering.
+
+    The polling membership path only hands *live* offering users to the
+    username backend; the accounts Waldur wants gone reach it through the
+    per-cycle sweep, which this periodic pass shares. Driving that pass keeps
+    the test on the code path an agent in event-processing mode really takes.
+    """
+    from waldur_site_agent.event_processing import utils as event_utils  # noqa: PLC0415
+
+    event_utils._run_username_backend_reconciliation(offering)
+
+
+def _set_inverted_project_member(client, user_uuid: str, *, member: bool) -> None:
+    action = "add_user" if member else "delete_user"
+    response = client.get_httpx_client().post(
+        f"/api/projects/{E2E_PROJECT_A_UUID}/{action}/",
+        json={"user": user_uuid, "role": _INVERTED_MEMBER_ROLE},
+    )
+    assert response.status_code in (200, 201), (
+        f"{action} for {user_uuid} failed: {response.status_code} {response.text}"
+    )
+
+
+def _inverted_offering_user_state(client, offering_uuid: str, user_uuid: str) -> str:
+    response = client.get_httpx_client().get(
+        "/api/marketplace-offering-users/",
+        params={"offering_uuid": offering_uuid, "user_uuid": user_uuid},
+    )
+    response.raise_for_status()
+    rows = response.json()
+    assert len(rows) == 1, f"Expected one offering user for {user_uuid}, got {rows}"
+    return rows[0]["state"]
+
+
+def _wait_inverted_offering_user_state(
+    client, offering_uuid: str, user_uuid: str, expected: str
+) -> None:
+    """Poll until Waldur's worker has moved the offering user to ``expected``."""
+    deadline = time.monotonic() + _INVERTED_STATE_TIMEOUT
+    state = ""
+    while time.monotonic() < deadline:
+        state = _inverted_offering_user_state(client, offering_uuid, user_uuid)
+        if state == expected:
+            return
+        time.sleep(2)
+    pytest.fail(f"Offering user of {user_uuid} still '{state}', expected '{expected}'")

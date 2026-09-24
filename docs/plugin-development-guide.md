@@ -52,6 +52,85 @@ graph TB
     class EXT external
 ```
 
+## Steps to implement a plugin
+
+This is the step-by-step path for a developer building a new backend
+plugin from scratch. It links out to the detailed reference sections
+below for the specifics of each step.
+
+1. **Study a reference plugin.** Pick the closest match to your target
+   system: `plugins/slurm/` for a CLI-based backend, `plugins/mup/` for
+   an HTTP API-based one, or `plugins/waldur/` if you need async orders
+   or federation-style hooks. Read its `backend.py`, `client.py`, and
+   `tests/` together — the tests show the expected call shapes.
+
+2. **Scaffold the package from the template.** Copy `docs/plugin-template/`
+   to a new directory (e.g. `plugins/mycustom/`) and rename the package
+   (`waldur_site_agent_mycustom` → `waldur_site_agent_<yours>`) and the
+   class names throughout.
+
+3. **Design the config.** Decide what goes in `backend_settings` (backend
+   behaviour, e.g. account prefixes) versus `backend_components` (billable
+   dimensions, e.g. cpu/storage). See the [annotated YAML configuration](
+   #annotated-yaml-configuration) below, and pick `unit_factor` values
+   carefully — see [Common pitfalls](#common-pitfalls).
+
+4. **Implement `BaseClient`.** This is the thin layer that talks to the
+   external system. Start with `get_resource`, `create_resource`,
+   `delete_resource`, and `list_resources` — see the [BaseClient method
+   reference](#baseclient-method-reference).
+
+5. **Implement `BaseBackend`.** Call `super().__init__(backend_settings,
+   backend_components)` first, then implement the abstract methods in
+   this order: `ping`, `_pre_create_resource`, `_collect_resource_limits`,
+   `_get_usage_report`. Fill in the remaining abstract methods, and only
+   override hook methods (`post_create_resource`, `_pre_delete_resource`,
+   etc.) if your backend needs the extra behaviour — see the [BaseBackend
+   method reference](#basebackend-method-reference) and [Agent mode method
+   matrix](#agent-mode-method-matrix) for what each mode calls.
+
+6. **Opt into capability flags as needed.** `supports_decreasing_usage`,
+   `supports_async_orders`, `supports_user_homedirs`,
+   `supports_periodic_settings`, `handled_resource_states`, etc. — see
+   [Capability flags and class attributes](#capability-flags-and-class-attributes).
+   Leave them at their defaults unless your backend actually needs the
+   behaviour change.
+
+7. **Add a username management backend, if needed.** Only required if
+   your system needs its own username generation/lookup logic instead of
+   the shared `base` backend — see [Username management
+   backends](#username-management-backends).
+
+8. **Register entry points in `pyproject.toml`.** At minimum
+   `waldur_site_agent.backends`; add `username_management_backends`,
+   `component_schemas`, or `backend_settings_schemas` groups as needed —
+   see [Entry point registration](#entry-point-registration).
+
+9. **Write tests.** Mock `BaseClient`, and assert the usage-report shape,
+   the limit-conversion math, and error handling per mode — see [Testing
+   guidance](#testing-guidance).
+
+10. **Install and verify.**
+
+    ```bash
+    uv sync --all-packages
+    cd plugins/mycustom && uv run pytest tests/
+    uv run waldur_site_diagnostics   # confirms the entry point resolves
+    uvx prek run --all-files
+    ```
+
+    Plugin tests only resolve their entry points when run from inside the
+    plugin directory — see the "Run plugin tests from inside the plugin
+    dir" gotcha in the repo's `CLAUDE.md`.
+
+11. **Wire it into a config file.** Add an `offerings` entry pointing
+    `order_processing_backend` / `reporting_backend` /
+    `membership_sync_backend` at your entry point name, and run the agent
+    against a real or staging offering to confirm end-to-end behaviour.
+
+Before opening a merge request, skim [Common pitfalls](#common-pitfalls)
+once more — most plugin review comments trace back to one of those six.
+
 ## BaseBackend method reference
 
 ### Abstract methods (must implement)
@@ -158,7 +237,8 @@ backend needs custom behavior.
 | `sync_resource_project` | No-op | Push project metadata to backends that manage their own projects |
 | `update_user_attributes` | No-op | Forward `OFFERING_USER` attribute updates to the backend |
 | `sync_offering_user_usernames` | Returns `False` | Pull backend-assigned usernames into Waldur (federation) |
-| `create_user_homedirs` | Provided | Override only to customise homedir quota or path logic |
+| `create_user_homedirs` | Provided | Customise homedir quota or path logic (see `supports_user_homedirs`) |
+| `apply_periodic_settings` | Reports failure | Apply periodic usage-policy settings (see `supports_periodic_settings`) |
 
 ### Non-blocking order creation (optional)
 
@@ -465,7 +545,7 @@ Calculation: `120000 / 60000 = 2`, `122880 / 61440 = 2`.
 
 ## Capability flags and class attributes
 
-`BaseBackend` exposes three class-level capability flags that change how
+`BaseBackend` exposes class-level capability flags that change how
 the core processor treats your backend.
 
 ### `supports_decreasing_usage: bool = False`
@@ -504,6 +584,63 @@ class MyAsyncBackend(BaseBackend):
     supports_async_orders = True
 ```
 
+### `supports_user_homedirs: bool = False`
+
+Set to `True` for backends that can create POSIX home directories for
+their users. The standalone `waldur_site_create_homedirs` command iterates
+over every configured offering and calls `create_user_homedirs` on each
+backend that declares support — the gate is the capability, not the
+backend type. The per-offering `enable_user_homedir_account_creation`
+setting can still opt out.
+
+```python
+class MyHpcBackend(BaseBackend):
+    supports_user_homedirs = True
+```
+
+A backend that opts in should also inherit `HomedirSettingsSchema` from
+`waldur_site_agent.common.plugin_schemas` in its settings schema, so
+`enable_user_homedir_account_creation`, `default_homedir_umask`,
+`homedir_base_path` and `homedir_quota` validate identically everywhere:
+
+```python
+from waldur_site_agent.common.plugin_schemas import HomedirSettingsSchema
+
+class MyHpcBackendSettingsSchema(HomedirSettingsSchema):
+    model_config = ConfigDict(extra="allow")
+```
+
+SLURM declares the flag today. Leave it `False` for API-only backends: the
+inherited `create_linux_user_homedir` shells out to the local
+`/sbin/mkhomedir_helper`, which is meaningless where the users have no
+account on the agent's host.
+
+Note that enabling the flag on an existing backend is a behaviour change for
+its deployments — `enable_user_homedir_account_creation` defaults to `True`,
+so operators already running `waldur_site_create_homedirs` will start getting
+home directories with no config change of their own. Land it with a release
+note.
+
+### `supports_periodic_settings: bool = False`
+
+Set to `True` for backends that implement `apply_periodic_settings`, the
+hook Waldur calls with periodic usage-policy settings (fairshare, limits,
+usage resets). Override the method alongside the flag:
+
+```python
+class MyBackend(BaseBackend):
+    supports_periodic_settings = True
+
+    def apply_periodic_settings(self, resource_id, settings, config=None):
+        ...
+        return {"success": True, "commands_executed": [...]}
+```
+
+The return value is relayed to Waldur's report-command-result endpoint, so
+it must carry a `success` key and, on failure, an `error` message. The
+default implementation returns an explicit failure — an unsupported backend
+still reports a verdict rather than leaving the policy without an answer.
+
 ### `handled_resource_states: list = [ResourceState.OK, ResourceState.ERRED]`
 
 Controls which resource states the membership processor fetches and
@@ -517,6 +654,27 @@ from waldur_api_client.models.resource_state import ResourceState
 class MyAsyncBackend(BaseBackend):
     handled_resource_states = [ResourceState.OK, ResourceState.ERRED, ResourceState.CREATING]
 ```
+
+### `team_fetch_attempts: int = 1` and `team_fetch_delay: float = 3.0`
+
+Control retry behaviour when `_fetch_user_context_for_resource` gets back
+an empty team list. The retry only fires on a completely empty response —
+it covers the race where a create-order event arrives before Waldur has
+committed the first membership row to the database.
+
+The default of `1` (no retries) is correct for synchronous backends where
+the Waldur API is always consistent by the time the agent reads it. Raise
+`team_fetch_attempts` for backends that receive work over STOMP, where the
+event and the membership row may arrive out of order:
+
+```python
+class MyStompBackend(BaseBackend):
+    team_fetch_attempts = 4   # retry up to 4 times
+    team_fetch_delay = 3.0    # seconds between retries
+```
+
+These are **backend class attributes**, not YAML configuration keys. They
+cannot be set per-offering in the configuration file.
 
 ## Decision matrix for no-op implementations
 
@@ -560,7 +718,7 @@ offerings:
 
     # Backend-specific settings (passed to __init__ as backend_settings)
     backend_settings:
-      default_account: "root"            # Default parent account
+      default_account: "root"            # DefaultAccount= on user associations
       customer_prefix: "cust_"           # Prefix for customer-level accounts
       project_prefix: "proj_"            # Prefix for project-level accounts
       allocation_prefix: "alloc_"        # Prefix for allocation-level accounts

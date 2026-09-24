@@ -46,7 +46,80 @@ _CR_PHASE_ERROR = "Error"
 # returns these as the human-readable display value, not the integer.
 _RP_STATES_PROGRESSING = frozenset({"Creating", "Updating", "Erred"})
 
+_CR_PHASES_PROGRESSING = frozenset({"Pending", "Creating", "Updating"})
+
 logger = logging.getLogger(__name__)
+
+
+def _derive_grant_states(
+    user_roles: list[dict],
+    role_map: dict,
+    cr_status: dict,
+    scope_type: str,
+    resource_project_uuid: Optional[str],
+    use_user_id: bool,
+) -> list[dict]:
+    """Map desired grants against operator-confirmed CR status.
+
+    Derivation per grant (only roles present in the map — unmapped ones
+    never reach the CR and stay unreported, which serializes as null on
+    the Waldur side):
+
+    - CR phase progressing (or unknown yet) -> pending
+    - CR phase Error                        -> error
+    - phase Ready, member confirmed         -> synced
+    - phase Ready, member absent            -> missing_in_idp
+
+    Membership confirmation uses the union of syncedMembers across the
+    CR's bindings — per-binding attribution would require reversing the
+    rendered group names, and a member missing from one group but
+    present in another within the same CR only occurs transiently.
+    """
+    phase = (cr_status or {}).get("phase")
+    bindings_key = (
+        "clusterKeycloakRoleBindings" if scope_type == "resource" else "keycloakRoleBindings"
+    )
+    confirmed = set()
+    for rb in (cr_status or {}).get(bindings_key) or []:
+        for member in rb.get("syncedMembers") or []:
+            ident = member.get("userIdentifier") if isinstance(member, dict) else member
+            if ident:
+                confirmed.add(ident)
+
+    entries: list[dict] = []
+    for ur in user_roles:
+        role = ur.get("role_name")
+        if not role or role not in role_map:
+            continue
+        ident = ur.get("user_uuid") if use_user_id else ur.get("user_username")
+        if not ident:
+            continue
+        if phase == "Error":
+            state = "error"
+            message = "Reconciliation failed on the provider side"
+        elif phase in _CR_PHASES_PROGRESSING or not phase:
+            state = "pending"
+            message = ""
+        elif ident in confirmed:
+            state = "synced"
+            message = ""
+        else:
+            state = "missing_in_idp"
+            message = (
+                "User not confirmed in the identity provider; "
+                "access activates after their first login"
+            )
+        entry = {
+            "scope_type": scope_type,
+            "role_name": role,
+            "state": state,
+            "message": message,
+        }
+        entry["user_uuid" if use_user_id else "username"] = ident
+        if resource_project_uuid:
+            entry["resource_project_uuid"] = resource_project_uuid
+        entries.append(entry)
+    return entries
 
 
 class RancherKcCrdBackend(backends.BaseBackend):
@@ -62,6 +135,14 @@ class RancherKcCrdBackend(backends.BaseBackend):
     path — they don't poke Keycloak directly. The operator owns the
     actual Keycloak/Rancher mutations.
     """
+
+    #: Tells the common processor's membership-sync loop to skip
+    #: diffing this backend's reported members against the flat
+    #: Waldur Project team. Our membership unit is a ResourceProject's
+    #: own UserRole list, already fully reconciled by pull_resource --
+    #: a flat-team diff would misclassify any ResourceProject-only
+    #: member (not on the parent Project's team) as stale.
+    skip_resource_team_diff = True
 
     def __init__(
         self,
@@ -81,6 +162,10 @@ class RancherKcCrdBackend(backends.BaseBackend):
 
         self.namespace: str = backend_settings.get("namespace", "waldur-system")
         self.role_map: dict[str, str] = backend_settings.get("role_map", {})
+        # Per-resource sync reports built during pull_resource from CR
+        # status, served to the membership processor via
+        # get_membership_sync_report after the user sync.
+        self._membership_sync_reports: dict[str, list[dict]] = {}
 
         self.crd = CrdClient(
             namespace=self.namespace,
@@ -89,9 +174,14 @@ class RancherKcCrdBackend(backends.BaseBackend):
         )
 
         # Waldur SDK client for fetching ResourceProjects + UserRoles.
-        # The base BaseBackend doesn't get a client at construction
-        # time, so we build our own from backend_settings (matching
-        # the pattern used by other plugins that need API access).
+        # This duplicates the offering's top-level waldur_api_url/token
+        # on purpose: backends don't get handed the framework's own
+        # Waldur client, and that's intentional -- it stays scoped to
+        # the processor rather than becoming something every backend
+        # can reach into. This plugin is the exception that actually
+        # needs to read Waldur directly (ResourceProjects/UserRoles
+        # aren't handed down any other way), so it builds its own
+        # client from its own settings instead.
         # Optional: when not configured, the backend can still write
         # CRs from external callers (e.g. tests injecting via
         # apply_resource_project) but pull_resource will be a no-op.
@@ -99,16 +189,6 @@ class RancherKcCrdBackend(backends.BaseBackend):
         api_token = backend_settings.get("waldur_api_token")
         self.waldur_client: Optional[AuthenticatedClient] = None
         if api_url and api_token:
-            # SDK paths already start with "/api/" (see e.g.
-            # waldur_api_client/api/marketplace_provider_resource_projects/
-            # marketplace_provider_resource_projects_list.py:41), so the
-            # base_url must be the host root without "/api". Users
-            # configure the canonical "https://host/api/" URL; strip the
-            # trailing "/api" precisely. (The core helper in
-            # waldur_site_agent/common/utils.py:206 uses .rstrip("/api")
-            # which strips the *character set* — same end result for
-            # normal hosts, but a footgun for a host ending in any of
-            # /, a, p, i.)
             self.waldur_client = AuthenticatedClient(
                 base_url=api_url.rstrip("/").removesuffix("/api"),
                 token=api_token,
@@ -221,11 +301,22 @@ class RancherKcCrdBackend(backends.BaseBackend):
                 waldur_resource.uuid,
                 len(rps),
             )
+            self._warn_unmapped_roles(
+                cluster_ur_dicts,
+                self.backend_settings.get("cluster_role_map") or {},
+                "cluster_role_map",
+                str(waldur_resource.uuid),
+            )
+
+        sync_report: list[dict] = []
+        use_user_id = bool(self.backend_settings.get("keycloak_use_user_id"))
+        last_cr_status: dict = {}
 
         for rp in rps:
             user_roles = self._fetch_resource_project_users(rp.uuid)
             rp_dict = self._resource_project_to_dict(rp)
             ur_dicts = [self._user_role_to_dict(u) for u in user_roles]
+            self._warn_unmapped_roles(ur_dicts, self.role_map, "role_map", f"{rp.name} ({rp.uuid})")
 
             body = build_cr_spec(
                 resource=resource_dict,
@@ -241,6 +332,32 @@ class RancherKcCrdBackend(backends.BaseBackend):
             cr_status = cr.get("status") or {}
             synced_users.update(extract_synced_users(cr_status))
             self._sync_rp_state_from_cr(rp, cr_status)
+            last_cr_status = cr_status
+            sync_report.extend(
+                _derive_grant_states(
+                    ur_dicts,
+                    self.role_map,
+                    cr_status,
+                    "resource_project",
+                    rp.uuid.hex,
+                    use_user_id,
+                )
+            )
+
+        # Cluster-scope grants ride every CR; any CR's status carries the
+        # shared clusterKeycloakRoleBindings, so the last one suffices.
+        if cluster_ur_dicts:
+            sync_report.extend(
+                _derive_grant_states(
+                    cluster_ur_dicts,
+                    self.backend_settings.get("cluster_role_map") or {},
+                    last_cr_status,
+                    "resource",
+                    None,
+                    use_user_id,
+                )
+            )
+        self._membership_sync_reports[waldur_resource.uuid.hex] = sync_report
 
         # Prune CRs whose backing ResourceProject no longer exists in
         # Waldur. List by `waldur.io/resource-uuid` label (set by the
@@ -406,9 +523,57 @@ class RancherKcCrdBackend(backends.BaseBackend):
             "user_username": getattr(u, "user_username", None),
         }
 
+    def get_membership_sync_report(self, waldur_resource: WaldurResource) -> Optional[list[dict]]:
+        """Return the per-grant states derived during the last pull_resource."""
+        return self._membership_sync_reports.get(waldur_resource.uuid.hex)
+
+    @staticmethod
+    def _warn_unmapped_roles(
+        user_roles: list[dict], role_map: dict, map_name: str, scope_label: str
+    ) -> None:
+        """Warn about role grants the translator will silently drop.
+
+        The translator skips user-roles whose role name is absent from the
+        configured map (it cannot invent a Rancher role template ID). That
+        skip is invisible to everyone unless surfaced here: the user was
+        granted a role in Waldur but never gains access in Rancher.
+        """
+        unmapped = sorted(
+            {
+                ur["role_name"]
+                for ur in user_roles
+                if ur.get("role_name") and ur["role_name"] not in role_map
+            }
+        )
+        if unmapped:
+            logger.warning(
+                "rancher-kc-crd: role(s) %s on %s are not present in the "
+                "agent's %s and will NOT be synced to Rancher; add them to "
+                "the offering's agent configuration to bind them",
+                ", ".join(unmapped),
+                scope_label,
+                map_name,
+            )
+
     # ------------------------------------------------------------------
     # Per-user mutations — routed through CR apply
     # ------------------------------------------------------------------
+    #
+    # add_users_to_resource/remove_users_from_resource are intentionally
+    # NOT overridden here. With skip_resource_team_diff = True, the
+    # common processor's membership diff (common/processors.py) never
+    # computes a non-empty new/stale set for this backend in the first
+    # place — the base BaseBackend.add_users_to_resource/
+    # remove_users_from_resource already log an accurate "No new users
+    # to add" / "No users to remove" for that case, so there's nothing
+    # left for a plugin-level override to correct.
+    #
+    # Kept for the direct role-change event path (process_user_role_change),
+    # which calls these singular methods straight from a Waldur *Project*
+    # role-grant/revoke webhook rather than the flat-team diff above. The
+    # username passed in is a project-level offering-user username; we
+    # ignore it and re-pull the true ResourceProject-scoped membership
+    # instead of trying to interpret it as a Keycloak identifier.
 
     def add_user(
         self,
@@ -422,18 +587,31 @@ class RancherKcCrdBackend(backends.BaseBackend):
         that. Easiest way to push the new state through is to re-run
         ``pull_resource``, which fetches the current ResourceProject
         users (now including this grant) and re-applies the CR.
+
+        ``username`` is the *offering user* username that triggered this
+        call (from the generic membership-sync loop), not the identifier
+        used for the Keycloak lookup — that's each ResourceProject's
+        ``UserRole.user_username``, which can differ and is only known
+        once ``pull_resource`` re-fetches it below.
         """
         logger.info(
-            "add_user(rancher-kc-crd): user=%s resource=%s role=%s — re-syncing CR",
+            "add_user(rancher-kc-crd): offering_user=%s resource=%s (%s) role=%s — re-syncing CR",
             username,
+            waldur_resource.backend_id,
             waldur_resource.uuid,
             kwargs.get("role_name"),
         )
         try:
-            self.pull_resource(waldur_resource)
+            info = self.pull_resource(waldur_resource)
         except Exception as exc:
             logger.warning("add_user CR re-sync failed: %s", exc)
             return False
+        logger.info(
+            "add_user(rancher-kc-crd): resource=%s (%s) synced Keycloak members after re-sync: %s",
+            waldur_resource.backend_id,
+            waldur_resource.uuid,
+            ", ".join(info.users) if info and info.users else "(none)",
+        )
         return True
 
     def remove_user(
@@ -442,18 +620,31 @@ class RancherKcCrdBackend(backends.BaseBackend):
         username: str,
         **kwargs: Any,  # noqa: ANN401
     ) -> bool:
-        """Re-apply the affected CR after a role revoke."""
+        """Re-apply the affected CR after a role revoke.
+
+        See :meth:`add_user` — ``username`` is the offering-user username,
+        not the Keycloak lookup identifier.
+        """
         logger.info(
-            "remove_user(rancher-kc-crd): user=%s resource=%s role=%s — re-syncing CR",
+            "remove_user(rancher-kc-crd): offering_user=%s resource=%s (%s) role=%s "
+            "— re-syncing CR",
             username,
+            waldur_resource.backend_id,
             waldur_resource.uuid,
             kwargs.get("role_name"),
         )
         try:
-            self.pull_resource(waldur_resource)
+            info = self.pull_resource(waldur_resource)
         except Exception as exc:
             logger.warning("remove_user CR re-sync failed: %s", exc)
             return False
+        logger.info(
+            "remove_user(rancher-kc-crd): resource=%s (%s) synced Keycloak members "
+            "after re-sync: %s",
+            waldur_resource.backend_id,
+            waldur_resource.uuid,
+            ", ".join(info.users) if info and info.users else "(none)",
+        )
         return True
 
     # ------------------------------------------------------------------

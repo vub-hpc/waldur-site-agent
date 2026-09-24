@@ -2,6 +2,19 @@
 
 This guide covers production deployment of Waldur Site Agent using systemd services.
 
+> **Deploying on Kubernetes?** Use the published Helm chart instead:
+>
+> ```bash
+> helm repo add waldur https://waldur.github.io/waldur-site-agent
+> helm repo update
+> helm install waldur-site-agent waldur/waldur-site-agent
+> ```
+>
+> The chart runs the same agent modes described below as separate deployments.
+> See the
+> [chart README](https://github.com/waldur/waldur-site-agent/blob/main/helm/waldur-site-agent/README.md)
+> for available versions and configurable values.
+
 ## Deployment Overview
 
 The agent can run in 4 different modes, deployed as separate systemd services:
@@ -251,6 +264,20 @@ sudo chown root:root /etc/waldur/waldur-site-agent-config.yaml
 
 ## Troubleshooting
 
+Before digging into a specific symptom below, run:
+
+```bash
+waldur_site_diagnostics -c /etc/waldur/waldur-site-agent-config.yaml
+```
+
+This checks the Waldur side of the setup — API reachability, token auth, offering state, loaded
+components — regardless of which backend you're running. It does **not** check backend
+connectivity (SLURM/MOAB/etc.). If you're on the SLURM backend, follow up with
+`waldur_site_diagnose_slurm_account -c /etc/waldur/waldur-site-agent-config.yaml` for a deeper
+check that compares actual SLURM account state against what Waldur expects. Other backends don't
+have an equivalent tool yet — for those, the sections below and the service logs are your best
+signal.
+
 ### Common Issues
 
 #### Service Won't Start
@@ -281,6 +308,48 @@ sudo chown root:root /etc/waldur/waldur-site-agent-config.yaml
    ```
 
 2. Check permissions and PATH
+
+#### Agent Identity Registration Is Refused
+
+Symptom — every cycle, for the same offering:
+
+```text
+Registering a new identity for offering my-offering with name agent-<uuid>
+Unable to register the identity agent-<uuid> for the offering my-offering:
+Unexpected status code: 400 ... {"offering":["Object with uuid=<uuid> does not exist."]}
+Continuing without agent telemetry.
+```
+
+The offering does exist. Waldur registers an agent identity only for the offering types listed
+under [`waldur_offering_uuid`](configuration.md#waldur_offering_uuid), and reports any other type
+as a missing object rather than as an unsupported one.
+
+The agent keeps processing the offering: the identity, its service and its processors are
+telemetry, and the agent's actual work — orders, membership sync, usage reporting — goes through
+the marketplace API and does not touch them. What you lose until the offering type is accepted:
+
+- the agent does not appear in Waldur's agent monitoring view, so there is no version, uptime,
+  dependency or processor information for it;
+- log shipping never starts. A shipper is keyed by the agent identity's UUID, so without an
+  identity there is nothing to attach a batch to — and the endpoint that receives the batches
+  applies the same offering-type restriction, so it would refuse them anyway. Agent logs stay in
+  the service's own output (`journalctl -u waldur-agent-*.service`).
+
+What to do:
+
+1. Confirm the offering's type, using the agent's own token:
+
+   ```bash
+   curl -s -H "Authorization: Token your-token" \
+     https://waldur.example.com/api/marketplace-provider-offerings/<offering-uuid>/ \
+     | jq '{name, type, state}'
+   ```
+
+2. If it comes back `404`, the UUID in `waldur_offering_uuid` is wrong or belongs to another
+   Waldur instance — the offering name in the log line comes from your configuration file, not
+   from the API, so a stale UUID looks identical to this symptom.
+3. If the type is not one of the supported ones, either move the agent to an offering of a
+   supported type, or ask your Waldur operator to widen the accepted types on the server.
 
 #### Waldur API Issues
 

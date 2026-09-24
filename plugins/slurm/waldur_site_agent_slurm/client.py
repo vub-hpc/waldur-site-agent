@@ -8,20 +8,22 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
-from waldur_site_agent.backend import clients
 from waldur_site_agent.backend import logger
 from waldur_site_agent.backend import utils as backend_utils
 from waldur_site_agent.backend.exceptions import (
     BackendError,
 )
 from waldur_site_agent.backend.structures import Association, ClientResource
+from waldur_site_agent_slurm.interface import SlurmClientInterface
 from waldur_site_agent_slurm.parser import SlurmAssociationLine, SlurmReportLine
 
 _PARTITION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# QoS names share the partition character set; guards against sacctmgr injection.
+_QOS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 WALDUR_SCRIPT_PREFIX = "/usr/local/bin/"
 
-class SlurmClient(clients.BaseClient):
+class SlurmClient(SlurmClientInterface):
     """This class implements Python client for SLURM.
 
     See also: https://slurm.schedmd.com/sacctmgr.html
@@ -49,9 +51,11 @@ class SlurmClient(clients.BaseClient):
         self.cluster_name = cluster_name
         self.executed_commands: list[str] = []
 
-    def clear_executed_commands(self) -> None:
-        """Clear the list of tracked executed commands."""
-        self.executed_commands = []
+    def get_version(self) -> str:
+        """Return the SLURM version string as reported by ``sinfo -V``."""
+        return self._execute_command(
+            ["-V"], command_name="sinfo", immediate=False, parsable=False
+        ).strip()
 
     def validate_slurm_binary(self) -> bool:
         """Validate that sacctmgr is a real SLURM binary, not an emulator.
@@ -112,8 +116,13 @@ class SlurmClient(clients.BaseClient):
 
         Strips double quotes to prevent breaking out of the quoted context
         and injecting additional sacctmgr parameters.
+
+        Collapses any whitespace runs (including newlines and tabs) into a
+        single space. Newlines stored in an account's description otherwise
+        make ``sacctmgr --parsable2`` emit a multi-line record, which breaks
+        line-based parsing on read-back (see issue #17).
         """
-        return value.replace('"', "")
+        return " ".join(value.replace('"', "").split())
 
     def create_resource(
         self,
@@ -141,6 +150,12 @@ class SlurmClient(clients.BaseClient):
         leaves it blank — so the parent must be read from the association.  Each
         account has one account-level association (empty User) plus one per member
         user; only the account-level row carries the parent we want.
+
+        Account names are case-insensitive in Slurm and stored lower-cased, so
+        ``show assoc account=Proj_A`` reports the account as ``proj_a``.  Compare
+        case-insensitively, otherwise a project whose name has capital letters is
+        never matched here — the caller then treats it as unparented and issues a
+        redundant reparent that Slurm rejects.
         """
         output = self._execute_command(
             ["show", "assoc", f"account={account}", "format=Account,ParentName,User", "-n", "-P"]
@@ -163,8 +178,40 @@ class SlurmClient(clients.BaseClient):
         )
 
     def delete_all_users_from_account(self, name: str) -> str:
-        """Drop all the users from the account based on the account name."""
+        """Drop all the users from the account based on the account name.
+
+        slurmdbd refuses to remove a user's *default* association while the
+        user keeps others (as_mysql_remove_assocs), so a user whose default is
+        this account is re-pointed at one of their remaining accounts first --
+        the same rule ``delete_association`` follows for a single user. Without
+        it the whole-account teardown hits the very restriction the per-user
+        path was fixed for.
+        """
+        self._repoint_defaults_away_from(name)
         return self._execute_command(["remove", "user", "where", f"account={name}"])
+
+    def _repoint_defaults_away_from(self, account: str) -> None:
+        """Move the DefaultAccount of every user defaulting to this account.
+
+        The listing can name the same user more than once (one row per
+        association), so each name is handled once.
+        """
+        target = account.lower()
+        for username in dict.fromkeys(self.list_resource_users(account)):
+            if self.get_user_default_account(username) != target:
+                continue
+            remaining = [item for item in self.list_user_accounts(username) if item != target]
+            if not remaining:
+                # This account is the user's last one: removing it takes the
+                # user record with it, which slurmdbd allows.
+                continue
+            logger.info(
+                "Moving default account of %s from %s to %s before removing the account's users",
+                username,
+                account,
+                remaining[0],
+            )
+            self.set_user_default_account(username, remaining[0])
 
     def account_has_users(self, account: str) -> bool:
         """Checks if the account with the specified name have related users."""
@@ -192,9 +239,21 @@ class SlurmClient(clients.BaseClient):
             ["modify", "user", username, "where", f"account={resource_id}", "set", quota]
         )
 
-    def set_account_qos(self, account: str, qos: str) -> None:
-        """Set the specified QoS for the account."""
-        self._execute_command(["modify", "account", account, "set", f"qos={qos}"])
+    def set_account_qos(self, account: str, qos: str, default_qos: Optional[str] = None) -> None:
+        """Set the specified QoS for the account.
+
+        ``default_qos`` is written in the same ``sacctmgr modify`` as the list.
+        slurmdbd validates the post-modify state of the account and of every
+        association under it: each effective DefaultQOS must be in its
+        effective QoS list, otherwise the whole request is rolled back with
+        "These associations don't have access to their default qos". Replacing
+        the list on an account that has a default therefore only succeeds when
+        the default moves with it, in the same command.
+        """
+        args = ["modify", "account", account, "set", f"qos={qos}"]
+        if default_qos:
+            args.append(f"defaultqos={default_qos}")
+        self._execute_command(args)
 
     def get_association(self, user: str, resource_id: str) -> Association | None:
         """Returns associations between the user and the account if exists."""
@@ -213,22 +272,84 @@ class SlurmClient(clients.BaseClient):
         return self._parse_association(lines[0])
 
     def create_association(
-        self, username: str, resource_id: str, default_account: Optional[str] = ""
+        self, username: str, resource_id: str, default_account: Optional[str] = None
     ) -> str:
         """Creates association between the account and the user in SLURM cluster."""
-        return self._execute_command(
-            [
-                "add",
-                "user",
-                username,
-                f"account={resource_id}",
-                f"DefaultAccount={default_account}",
-                "Share=parent",  # Inherits fairshare value from the parent account
-            ]
+        args = ["add", "user", username, f"account={resource_id}"]
+        if default_account is not None:
+            args.append(f"DefaultAccount={default_account}")
+        args.append("Share=parent")  # Inherits fairshare value from the parent account
+        return self._execute_command(args)
+
+    def list_user_accounts(self, username: str) -> list[str]:
+        """Accounts the user holds an association with, lower-cased, deduplicated, sorted.
+
+        The rows are matched by their user column rather than trusting the
+        ``where`` filter (an implementation that ignores it would otherwise
+        report every association on the cluster). Account names are folded to
+        lower case: slurmdbd stores them that way and prints them that way,
+        whatever case they were created with.
+        """
+        output = self._execute_command(
+            ["show", "association", "where", f"user={username}", "format=user,account"]
+        )
+        accounts = set()
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            user, account, *_ = (*line.split("|"), "")
+            if user.strip() == username and account.strip():
+                accounts.add(account.strip().lower())
+        return sorted(accounts)
+
+    def get_user_default_account(self, username: str) -> Optional[str]:
+        """The user's DefaultAccount, or None when the user is unknown."""
+        output = self._execute_command(
+            ["show", "user", "where", f"name={username}", "format=user,defaultaccount"]
+        )
+        # Match the row by its user column rather than trusting the filter: a
+        # listing that ignores ``where`` (or one seeded with other users, such
+        # as root) would otherwise hand back somebody else's default.
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            name, default_account, *_ = (*line.split("|"), "")
+            if name.strip() == username:
+                return default_account.strip().lower() or None
+        return None
+
+    def set_user_default_account(self, username: str, account: str) -> None:
+        """Re-point the user's DefaultAccount."""
+        self._execute_command(
+            ["modify", "user", "where", f"name={username}", "set", f"DefaultAccount={account}"]
         )
 
+    def delete_user(self, username: str) -> str:
+        """Remove the user record together with every association it holds."""
+        return self._execute_command(["remove", "user", "where", f"name={username}"])
+
     def delete_association(self, username: str, resource_id: str) -> str:
-        """Deletes association between the account and the user in SLURM cluster."""
+        """Delete the association between the account and the user, slurmdbd-style.
+
+        slurmdbd refuses to remove a user's *default* association while the
+        user keeps others (as_mysql_remove_assocs), so the default is moved to
+        one of the remaining accounts first. When this is the user's last
+        association the user record goes with it, which is what
+        ``sacctmgr remove user`` does and what the emulator mirrors.
+        """
+        accounts = self.list_user_accounts(username)
+        remaining = [account for account in accounts if account != resource_id.lower()]
+        if accounts and not remaining:
+            logger.info("Removing user %s: %s was its last association", username, resource_id)
+            return self.delete_user(username)
+        if remaining and self.get_user_default_account(username) == resource_id.lower():
+            logger.info(
+                "Moving default account of %s from %s to %s before removing the association",
+                username,
+                resource_id,
+                remaining[0],
+            )
+            self.set_user_default_account(username, remaining[0])
         return self._execute_command(
             [
                 "remove",
@@ -362,23 +483,35 @@ class SlurmClient(clients.BaseClient):
 
     def get_current_account_qos(self, account: str) -> str:
         """Returns a name of the current QoS of the account."""
+        return self._get_account_association_column(account, "qos")
+
+    def get_current_account_default_qos(self, account: str) -> str:
+        """Return the effective DefaultQOS of the account, or "" when none is set.
+
+        ``sacctmgr list associations`` reports the inherited default when the
+        account row has none of its own, which is exactly the value slurmdbd
+        checks against the QoS list on modify.
+        """
+        return self._get_account_association_column(account, "defaultqos")
+
+    def _get_account_association_column(self, account: str, column: str) -> str:
         args = [
             "list",
             "associations",
-            "format=account,qos",
+            f"format=account,{column}",
             "where",
             f"account={account}",
         ]
         output = self._execute_command(args)
-        # sacctmgr returns one row per association ("account|qos"); --parsable2
-        # emits no trailing separator. Match on the account column and take the
-        # qos column.
-        min_columns_for_qos = 2
+        # sacctmgr returns one row per association ("account|<column>");
+        # --parsable2 emits no trailing separator. Match on the account column
+        # and take the requested column from the first matching row.
+        min_columns = 2
         for line in output.splitlines():
             if "|" not in line:
                 continue
             parts = line.split("|")
-            if len(parts) < min_columns_for_qos or parts[0].strip() != account:
+            if len(parts) < min_columns or parts[0].strip() != account:
                 continue
             return parts[1].strip()
         return ""
@@ -405,23 +538,35 @@ class SlurmClient(clients.BaseClient):
         return [line.split("|")[0] for line in output.splitlines() if "|" in line]
 
     def check_user_exists(self, username: str) -> bool:
-        """Check if the user exists in the system."""
+        """Check if the user exists in the system (local ``id`` lookup).
+
+        Unknown user is False. Any other failure -- ``id`` missing on the host,
+        NSS down -- is raised as a BackendError naming the cause, never a crash
+        from an unset result.
+        """
         args = ["-u", username]
         try:
             output = self._execute_command(
                 args, command_name="id", immediate=False, parsable=False, silent=True
             )
         except BackendError as e:
-            if "no such user" in str(e):
+            if "no such user" in str(e).lower():
                 return False
+            msg = f"Cannot check whether user {username} exists on this host: {e}"
+            raise BackendError(msg) from e
         return output.strip().isdigit()
 
     def _parse_account(self, line: str) -> ClientResource:
-        parts = line.split("|")
+        # Accounts created before descriptions were sanitized may contain
+        # newlines, in which case ``sacctmgr --parsable2`` splits the record
+        # across several lines and this ``line`` holds only the leading part
+        # (see issue #17). Pad with empty fields instead of raising IndexError
+        # so such accounts can still be detected and processed.
+        name, description, organization, *_ = (*line.split("|"), "", "")
         return ClientResource(
-            name=parts[0],
-            description=parts[1],
-            organization=parts[2],
+            name=name,
+            description=description,
+            organization=organization,
         )
 
     def _parse_association(self, line: str) -> Association:
@@ -504,9 +649,10 @@ class SlurmClient(clients.BaseClient):
             return self.execute_command(account_command, silent=silent)
         except BackendError as e:
             if command and command[0] == "modify" and "Nothing modified" in str(e):
-                # Real sacctmgr prints "Nothing modified" with exit 0 for a
-                # no-op modify, but keep this guard for versions/paths that
-                # exit non-zero — the desired state is already reached.
+                # Real sacctmgr prints "Nothing modified" on stdout but exits 1
+                # for a no-op modify (account_functions.c:726-729 returns
+                # SLURM_ERROR; sacctmgr.c:982-984 maps that to exit_code=1).
+                # The desired state is already reached, so treat it as success.
                 return ""
             raise
 
@@ -578,6 +724,47 @@ class SlurmClient(clients.BaseClient):
             ["modify", "account", "set", f"defaultqos={qos_name}", "where", f"account={account}"]
         )
 
+    def set_qos_grp_tres_mins(self, qos_name: str, limits_dict: dict[str, int]) -> None:
+        """Set GrpTRESMins on the QoS (allocation budget lives on the QoS)."""
+        limits_str = ",".join([f"{key}={value}" for key, value in sorted(limits_dict.items())])
+        self._execute_command(["modify", "qos", qos_name, "set", f"GrpTRESMins={limits_str}"])
+
+    def get_qos_grp_tres_mins(self, qos_name: str) -> dict[str, int]:
+        """Return GrpTRESMins of the named QoS."""
+        output = self._execute_command(
+            ["show", "qos", qos_name, "format=Name,GrpTRESMins"],
+            immediate=False,
+        )
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            name, _, tres_field = line.partition("|")
+            if name.strip() != qos_name:
+                continue
+            parsed = self._parse_tres_string(tres_field.strip())
+            result: dict[str, int] = {}
+            for key, value in parsed.items():
+                try:
+                    result[key] = int(value)
+                except (TypeError, ValueError):
+                    continue
+            return result
+        return {}
+
+    def reset_qos_raw_usage(self, qos_name: str) -> None:
+        """Reset RawUsage on the QoS so the new GrpTRESMins budget starts clean."""
+        self._execute_command(["modify", "qos", qos_name, "set", "RawUsage=0"])
+
+    def set_account_grp_submit_jobs(self, account: str, value: int) -> None:
+        """Set GrpSubmitJobs on the account (``value=-1`` clears the limit).
+
+        The orthogonal pause lever for QoS-enforcing offerings: ``GrpSubmitJobs=0``
+        blocks new job submission without touching the account/association QoS, so
+        a pause cannot clobber a per-association QoS grant. Restore clears it with
+        ``value=-1``.
+        """
+        self._execute_command(["modify", "account", account, "set", f"GrpSubmitJobs={value}"])
+
     # ===== PARTITION-AWARE ASSOCIATION EXTENSION =====
 
     def create_association_with_partition(
@@ -585,27 +772,24 @@ class SlurmClient(clients.BaseClient):
         username: str,
         resource_id: str,
         partition: str,
-        default_account: Optional[str] = "",
+        default_account: Optional[str] = None,
     ) -> str:
         """Create an association between a user and account with a specific partition."""
-        command = [
-            "add",
-            "user",
-            username,
-            f"account={resource_id}",
-            f"Partition={partition}",
-        ]
-        if default_account:
-            command.append(f"DefaultAccount={default_account}")
-
-        return self._execute_command(command, silent=True)
+        if not _PARTITION_NAME_RE.match(partition):
+            msg = f"Invalid SLURM partition name: {partition!r}"
+            raise BackendError(msg)
+        args = ["add", "user", username, f"account={resource_id}"]
+        if default_account is not None:
+            args.append(f"DefaultAccount={default_account}")
+        args.append(f"Partition={partition}")
+        return self._execute_command(args)
 
     def create_association_with_partitions(
         self,
         username: str,
         resource_id: str,
         partitions: Sequence[str],
-        default_account: Optional[str] = "",
+        default_account: Optional[str] = None,
     ) -> str:
         """Create a user→account association restricted to the given partitions.
 
@@ -624,17 +808,60 @@ class SlurmClient(clients.BaseClient):
                 msg = f"Invalid SLURM partition name: {name!r}"
                 raise BackendError(msg)
         sorted_parts = sorted(partitions)
-        args = [
-            "add",
-            "user",
-            username,
-            f"account={resource_id}",
-            f"Partitions={','.join(sorted_parts)}",
-            "Share=parent",
-        ]
-        if default_account:
+        args = ["add", "user", username, f"account={resource_id}"]
+        if default_account is not None:
             args.append(f"DefaultAccount={default_account}")
-        return self._execute_command(args, silent=True)
+        args.extend([f"Partitions={','.join(sorted_parts)}", "Share=parent"])
+        return self._execute_command(args)
+
+    def create_association_with_qos(
+        self,
+        username: str,
+        resource_id: str,
+        qos_list: Sequence[str],
+        default_qos: Optional[str] = None,
+        partitions: Optional[Sequence[str]] = None,
+        default_account: Optional[str] = None,
+    ) -> str:
+        """Create a user→account association granting a specific QoS set.
+
+        Emits ``sacctmgr add user … [Partitions=p1,p2] QosLevel=q1,q2
+        [DefaultQOS=d] Share=parent`` — the per-association qos_list /
+        def_qos_id grant (slurmdb_assoc_rec_t). QoS composes with partitions:
+        SLURM stores one association row per partition, each carrying the same
+        QoS grant, so a multi-partition call grants the QoS on every partition;
+        with no partition a single cluster-wide association is granted. The QoS
+        names must also be permitted by each partition's AllowQos gate
+        (site-admin config); this only sets the association side.
+        """
+        if not qos_list:
+            msg = "qos_list must be non-empty"
+            raise BackendError(msg)
+        for name in qos_list:
+            if not _QOS_NAME_RE.match(name):
+                msg = f"Invalid SLURM QoS name: {name!r}"
+                raise BackendError(msg)
+        if default_qos is not None and not _QOS_NAME_RE.match(default_qos):
+            msg = f"Invalid SLURM QoS name: {default_qos!r}"
+            raise BackendError(msg)
+        sorted_parts: list[str] = []
+        if partitions:
+            for name in partitions:
+                if not _PARTITION_NAME_RE.match(name):
+                    msg = f"Invalid SLURM partition name: {name!r}"
+                    raise BackendError(msg)
+            sorted_parts = sorted(partitions)
+        args = ["add", "user", username, f"account={resource_id}"]
+        if default_account is not None:
+            args.append(f"DefaultAccount={default_account}")
+        if sorted_parts:
+            args.append(f"Partitions={','.join(sorted_parts)}")
+        args.append(f"QosLevel={','.join(qos_list)}")
+        if default_qos is not None:
+            args.append(f"DefaultQOS={default_qos}")
+        args.append("Share=parent")
+        return self._execute_command(args)
+>>>>>>> main
 
     # ===== PERIODIC LIMITS EXTENSION =====
 

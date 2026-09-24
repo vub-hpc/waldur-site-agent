@@ -72,6 +72,56 @@ def _make_backend(extra_settings: Optional[dict] = None) -> SlurmBackend:
     return backend
 
 
+class TestRootAccountDecoupling:
+    """The account-tree root (root_account) is independent of the user DefaultAccount.
+
+    ``default_account`` is the ``DefaultAccount=`` placed on user associations, while
+    ``root_account`` is the parent of the top-tier customer account. They used to be a
+    single setting; these tests pin the decoupled behaviour.
+    """
+
+    def test_root_account_defaults_to_default_account(self):
+        # No root_account configured: the customer account is parented under default_account.
+        backend = _make_backend(extra_settings={"default_account": "restricted_access"})
+        assert backend._root_account == "restricted_access"
+
+        waldur_resource = _make_waldur_resource(customer_slug="org-b", customer_name="Org B")
+        with patch.object(backend, "_create_backend_resource") as mock_create:
+            backend._pre_create_resource(waldur_resource)
+
+        mock_create.assert_any_call("hpc_org-b", "Org B", "hpc_org-b", "restricted_access")
+
+    def test_root_account_overrides_parent_without_touching_user_default(self):
+        backend = _make_backend(
+            extra_settings={"default_account": "restricted_access", "root_account": "root"}
+        )
+        assert backend._root_account == "root"
+
+        waldur_resource = _make_waldur_resource(customer_slug="org-b", customer_name="Org B")
+        with patch.object(backend, "_create_backend_resource") as mock_create:
+            backend._pre_create_resource(waldur_resource)
+
+        # Customer account is rooted at "root", not under the restricted user account.
+        mock_create.assert_any_call("hpc_org-b", "Org B", "hpc_org-b", "root")
+        mock_create.assert_any_call(
+            "hpc_project-alpha", "Project Alpha", "hpc_project-alpha", "hpc_org-b"
+        )
+
+    def test_user_association_uses_default_account_not_root_account(self):
+        backend = _make_backend(
+            extra_settings={"default_account": "restricted_access", "root_account": "root"}
+        )
+        backend.client.get_association.return_value = None
+
+        waldur_resource = _make_waldur_resource()
+        backend.add_user(waldur_resource, "alice")
+
+        # DefaultAccount stays the restricted account regardless of root_account.
+        backend.client.create_association.assert_called_once_with(
+            "alice", waldur_resource.backend_id, "restricted_access"
+        )
+
+
 class TestGetAccountParent:
     """Unit tests for SlurmClient.get_account_parent()."""
 
@@ -113,6 +163,25 @@ class TestGetAccountParent:
         assert "account=hpc_project-alpha" in cmd
         assert "format=Account,ParentName,User" in cmd
 
+    def test_matches_account_case_insensitively(self, client):
+        # Slurm folds account names to lower case: a project created as
+        # 2026_00A is stored and reported as 2026_00a. The Waldur backend_id
+        # keeps the original case, so the row must still be matched — this is
+        # the exact output real sacctmgr emits for the mixed-case query.
+        client.execute_command.return_value = "2026_00a|hpc_org-a|\n2026_00a|hpc_org-a|alice\n"
+        assert client.get_account_parent("2026_00A") == "hpc_org-a"
+
+    def test_returns_none_when_only_case_differs_but_account_absent(self, client):
+        # A genuinely different account (not just a case variant) still misses.
+        client.execute_command.return_value = "2026_00b|hpc_org-a|\n"
+        assert client.get_account_parent("2026_00A") is None
+
+    def test_matches_when_stored_upper_and_query_lower(self, client):
+        # Symmetry guard: the fold must work in both directions, not only when
+        # the stored form happens to be lower case.
+        client.execute_command.return_value = "PROJ_X|hpc_org-a|\n"
+        assert client.get_account_parent("proj_x") == "hpc_org-a"
+
 
 class TestSetAccountParent:
     """Unit tests for SlurmClient.set_account_parent()."""
@@ -134,10 +203,16 @@ class TestSetAccountParent:
 class TestSyncResourceProject:
     """Tests for SlurmBackend.sync_resource_project()."""
 
-    def test_reparents_when_parent_is_stale(self):
+    def test_reparents_project_and_resource_when_both_stale(self):
         backend = _make_backend()
-        # First call: pre-check returns stale parent; second call: post-verify returns correct.
-        backend.client.get_account_parent.side_effect = ["hpc_org-a", "hpc_org-b"]
+        # Calls: (1) project pre-check stale, (2) project post-verify correct,
+        # (3) resource pre-check dangling, (4) resource post-verify correct.
+        backend.client.get_account_parent.side_effect = [
+            "hpc_org-a",
+            "hpc_org-b",
+            None,
+            "hpc_project-alpha",
+        ]
 
         waldur_resource = _make_waldur_resource(
             project_slug="project-alpha",
@@ -151,6 +226,31 @@ class TestSyncResourceProject:
         assert mock_create.call_count == 2
         mock_create.assert_any_call("hpc_org-b", "Org B", "hpc_org-b", "root")
         mock_create.assert_any_call("hpc_project-alpha", "Project Alpha", "hpc_project-alpha", "hpc_org-b")
+        assert backend.client.set_account_parent.call_count == 2
+        backend.client.set_account_parent.assert_any_call("hpc_project-alpha", "hpc_org-b")
+        backend.client.set_account_parent.assert_any_call("hpc_test-alloc", "hpc_project-alpha")
+
+    def test_does_not_reparent_resource_account_when_already_correct(self):
+        # The common case: an allocation account's ParentName already points at the
+        # project account (it moved for free when the project was reparented), so
+        # the explicit resource-level reparent — which sacctmgr would reject as
+        # "Nothing modified" (exit 1) — must be skipped, not attempted blindly.
+        backend = _make_backend()
+        backend.client.get_account_parent.side_effect = [
+            "hpc_org-a",
+            "hpc_org-b",
+            "hpc_project-alpha",
+        ]
+
+        waldur_resource = _make_waldur_resource(
+            project_slug="project-alpha",
+            customer_slug="org-b",
+            customer_name="Org B",
+        )
+
+        with patch.object(backend, "_create_backend_resource"):
+            backend.sync_resource_project(waldur_resource)
+
         backend.client.set_account_parent.assert_called_once_with("hpc_project-alpha", "hpc_org-b")
 
     def test_no_reparent_when_parent_already_correct(self):
@@ -168,8 +268,9 @@ class TestSyncResourceProject:
 
     def test_creates_accounts_and_sets_parent_when_project_account_missing(self):
         backend = _make_backend()
-        # First call: account missing; second call: post-verify confirms correct parent.
-        backend.client.get_account_parent.side_effect = [None, "hpc_org-b"]
+        # Calls: (1) account missing, (2) post-verify project correct,
+        # (3) resource pre-check already correct.
+        backend.client.get_account_parent.side_effect = [None, "hpc_org-b", "hpc_project-alpha"]
 
         waldur_resource = _make_waldur_resource(
             project_slug="project-alpha",
@@ -248,8 +349,9 @@ class TestSyncResourceProject:
 
     def test_warns_when_parent_mismatch_after_reparent(self):
         backend = _make_backend()
-        # Pre-check: stale parent. Post-verify: still wrong (set_account_parent silently no-oped).
-        backend.client.get_account_parent.side_effect = ["hpc_org-a", "hpc_org-a"]
+        # Calls: (1) pre-check stale, (2) post-verify project still wrong (silently
+        # no-oped), (3) resource pre-check already correct.
+        backend.client.get_account_parent.side_effect = ["hpc_org-a", "hpc_org-a", "hpc_project-alpha"]
 
         waldur_resource = _make_waldur_resource(
             project_slug="project-alpha",
@@ -257,15 +359,38 @@ class TestSyncResourceProject:
         )
 
         with patch.object(backend, "_create_backend_resource"):
-            with patch.object(backend, "_get_logger_name", create=True):
-                backend.sync_resource_project(waldur_resource)
+            backend.sync_resource_project(waldur_resource)
 
         # set_account_parent was still attempted even though it didn't take effect.
         backend.client.set_account_parent.assert_called_once_with("hpc_project-alpha", "hpc_org-b")
 
+    def test_reparents_resource_account_even_when_project_reparent_failed_to_verify(self):
+        # The resource-level safety net still runs after a project-level warning
+        # (not a hard error) — it's an independent check against the resource's
+        # own parent, not contingent on the project-level verify succeeding.
+        backend = _make_backend()
+        backend.client.get_account_parent.side_effect = [
+            "hpc_org-a",
+            "hpc_org-a",
+            None,
+            "hpc_project-alpha",
+        ]
+
+        waldur_resource = _make_waldur_resource(
+            project_slug="project-alpha",
+            customer_slug="org-b",
+        )
+
+        with patch.object(backend, "_create_backend_resource"):
+            backend.sync_resource_project(waldur_resource)
+
+        assert backend.client.set_account_parent.call_count == 2
+        backend.client.set_account_parent.assert_any_call("hpc_project-alpha", "hpc_org-b")
+        backend.client.set_account_parent.assert_any_call("hpc_test-alloc", "hpc_project-alpha")
+
     def test_uses_backend_id_as_fallback_when_names_are_unset(self):
         backend = _make_backend()
-        backend.client.get_account_parent.side_effect = [None, "hpc_org-b"]
+        backend.client.get_account_parent.side_effect = [None, "hpc_org-b", "hpc_project-alpha"]
 
         waldur_resource = _make_waldur_resource(
             project_slug="project-alpha",

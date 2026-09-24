@@ -10,9 +10,51 @@ service provider backends (SLURM, MOAB, MUP clusters).
 - Kubernetes 1.19+
 - Helm 3.2.0+
 
+### Adding the Chart Repository
+
+Released charts are published to a Helm repository hosted on GitHub Pages:
+
+```bash
+helm repo add waldur https://waldur.github.io/waldur-site-agent
+helm repo update
+```
+
+List the available versions:
+
+```bash
+helm search repo waldur/waldur-site-agent --versions
+```
+
+Release candidates (for example `1.0.6-rc.19`) are pre-release versions and are
+hidden unless you pass `--devel`:
+
+```bash
+helm search repo waldur/waldur-site-agent --versions --devel
+```
+
+The chart is also indexed on Artifact Hub, which tracks the same repository:
+<https://artifacthub.io/packages/helm/waldur-site-agent/waldur-site-agent>
+
 ### Installing the Chart
 
 To install the chart with the release name `my-waldur-site-agent`:
+
+```bash
+helm install my-waldur-site-agent waldur/waldur-site-agent
+```
+
+Pin an explicit version (recommended for production). Add `--devel` when
+installing a release candidate:
+
+```bash
+helm install my-waldur-site-agent waldur/waldur-site-agent --version <VERSION>
+```
+
+The chart version mirrors the agent release version, and the chart's default
+`image.tag` is set to the matching agent image at release time.
+
+To install from a checkout of this repository instead — useful when developing
+the chart itself:
 
 ```bash
 helm install my-waldur-site-agent ./helm/waldur-site-agent
@@ -62,6 +104,18 @@ The following table lists the configurable parameters of the Waldur Site Agent c
 | `secret.name` | Secret name (generated if empty) | `""` |
 | `secret.data.config.yaml` | Complete agent configuration | See values.yaml |
 
+### ServiceAccount Configuration
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `serviceAccount.create` | Create a ServiceAccount (named after the chart fullname if `name` is empty) | `false` |
+| `serviceAccount.name` | ServiceAccount to run agent pods as (`default` if empty and `create` is false) | `""` |
+| `serviceAccount.annotations` | Annotations for the created ServiceAccount | `{}` |
+
+Backends that call the Kubernetes API (e.g. `envoy`) need a ServiceAccount with matching RBAC.
+Set `serviceAccount.name` to a pre-created ServiceAccount, or set `serviceAccount.create: true`
+and bind the required Role to it.
+
 ### Resources & Security
 
 | Parameter | Description | Default |
@@ -77,12 +131,23 @@ The following table lists the configurable parameters of the Waldur Site Agent c
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `healthCheck.enabled` | Enable health checks using diagnostics | `true` |
-| `healthCheck.initialDelaySeconds` | Initial delay for health checks | `30` |
-| `healthCheck.periodSeconds` | Health check interval | `60` |
-| `healthCheck.timeoutSeconds` | Health check timeout | `10` |
-| `healthCheck.failureThreshold` | Failed checks before restart | `3` |
+| `healthCheck.enabled` | Enable liveness, readiness and startup probes | `true` |
+| `healthCheck.initialDelaySeconds` | Initial delay for liveness and readiness | `30` |
+| `healthCheck.periodSeconds` | Liveness and readiness interval | `60` |
+| `healthCheck.timeoutSeconds` | Probe timeout, shared by all three probes | `10` |
+| `healthCheck.failureThreshold` | Failed liveness checks before restart | `3` |
 | `healthCheck.successThreshold` | Successful checks to be considered healthy | `1` |
+| `healthCheck.startupProbe.enabled` | Give the agent a startup grace period | `true` |
+| `healthCheck.startupProbe.periodSeconds` | Startup probe interval | `10` |
+| `healthCheck.startupProbe.failureThreshold` | Startup attempts before giving up | `30` |
+
+Liveness only reads the heartbeat file the agent's main loop writes; readiness
+additionally calls `GET /api/users/me/` on Waldur. The startup probe covers the
+cold start, during which the agent loads its config and contacts Waldur once
+before the first heartbeat is written -- without it that time counts against
+liveness and a slow Waldur restarts the pod before it ever runs. Raise
+`startupProbe.failureThreshold` (attempts, `periodSeconds` apart) for a site
+whose Waldur is slow to answer.
 
 ## Usage Examples
 

@@ -1,0 +1,36 @@
+[project]
+name = "waldur-site-agent-ceph-s3"
+version = "1.0.8rc4"
+description = "Ceph S3 storage plugin (croit and RadosGW flavours)"
+readme = "README.md"
+authors = [{ name = "OpenNode Team", email = "info@opennodecloud.com" }]
+requires-python = ">=3.9.2, <4"
+dependencies = [
+    "waldur-site-agent>=1.0.8rc4",
+    "httpx>=0.25.0",
+    "boto3>=1.40.71"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+waldur-site-agent = { workspace = true }
+
+# Entry points for exporting backends
+[project.entry-points."waldur_site_agent.backends"]
+ceph_s3 = "waldur_site_agent_ceph_s3.backend:CephS3Backend"
+# Reporting only: GB-day metering reads croit's statistics subsystem, which
+# has no RadosGW equivalent.
+croit_usage = "waldur_site_agent_ceph_s3.reporting:CroitUsageBackend"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/**/*.py" = [
+  "S101",   # we can (and MUST!) use 'assert' in test files.
+  "ANN001", # annotations for fixtures are sometimes a pain for test files
+  "PLR2004", # magic values are OK in tests
+  "PT011",   # pytest.raises can be broad in tests
+  "S106",    # hardcoded passwords are OK in test fixtures
+  "ARG002",  # unused arguments from mock decorators are OK
+]

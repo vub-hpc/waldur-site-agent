@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from uuid import UUID
 
 import pytest
@@ -36,6 +37,7 @@ from waldur_api_client.api.marketplace_orders import (
 from waldur_api_client.api.marketplace_provider_resources import (
     marketplace_provider_resources_retrieve,
 )
+from waldur_api_client.api.marketplace_resources import marketplace_resources_terminate
 from waldur_api_client.api.marketplace_slurm_periodic_usage_policies import (
     marketplace_slurm_periodic_usage_policies_destroy,
 )
@@ -55,7 +57,7 @@ from waldur_api_client.models.order_create_request_limits import (
 )
 from waldur_api_client.models.order_state import OrderState
 from waldur_api_client.models.policy_period_enum import PolicyPeriodEnum
-from waldur_api_client.models.request_types import RequestTypes
+from waldur_api_client.models.resource_terminate_request import ResourceTerminateRequest
 from waldur_api_client.types import UNSET
 from waldur_site_agent_slurm.backend import SlurmBackend
 
@@ -63,6 +65,7 @@ from waldur_site_agent.common.utils import get_client, load_configuration
 from waldur_site_agent.event_processing import handlers
 from waldur_site_agent.event_processing.event_subscription_manager import (
     WALDUR_LISTENER_NAME,
+    route_message,
 )
 from waldur_site_agent.event_processing.utils import (
     setup_stomp_offering_subscriptions,
@@ -96,16 +99,15 @@ class ResourceEventCapture:
     def __init__(self):
         self._messages: list[dict] = []
         self._lock = threading.Lock()
-        self._waiters: dict[str, threading.Event] = {}
+        self._waiters: list[tuple[Callable[[dict], bool], threading.Event]] = []
 
     def make_handler(self, delegate):
         def handler(frame, offering, user_agent, expose_backend_error_details=True):  # noqa: ARG001
             message = json.loads(frame.body)
             with self._lock:
                 self._messages.append(message)
-                for key, evt in list(self._waiters.items()):
-                    field, value = key.split("=", 1)
-                    if str(message.get(field, "")) == value:
+                for predicate, evt in list(self._waiters):
+                    if predicate(message):
                         evt.set()
             # Delegate to the real handler so the agent's resource sync runs.
             delegate(frame, offering, user_agent)
@@ -113,21 +115,41 @@ class ResourceEventCapture:
         return handler
 
     def wait_for(
-        self, field: str, value: str, timeout: float = STOMP_WAIT_TIMEOUT
+        self,
+        field: str,
+        value: str,
+        timeout: float = STOMP_WAIT_TIMEOUT,
+        where: Callable[[dict], bool] | None = None,
     ) -> dict | None:
+        """Wait for a RESOURCE event on `field == value`, optionally narrowed by `where`.
+
+        A resource emits several RESOURCE events over its lifetime, and earlier
+        ones are already buffered by the time a test waits for a later state
+        change. Matching on the identifier alone returns whichever event happens
+        to be buffered rather than the one under test, so the assertion passes or
+        fails purely on timing. Pass `where` to wait for the specific transition
+        being asserted.
+        """
+
+        def matches(msg: dict) -> bool:
+            return str(msg.get(field, "")) == value and (where is None or where(msg))
+
         with self._lock:
             for msg in reversed(self._messages):
-                if str(msg.get(field, "")) == value:
+                if matches(msg):
                     return msg
-            key = f"{field}={value}"
             evt = threading.Event()
-            self._waiters[key] = evt
+            self._waiters.append((matches, evt))
 
-        if evt.wait(timeout=timeout):
+        try:
+            if evt.wait(timeout=timeout):
+                with self._lock:
+                    for msg in reversed(self._messages):
+                        if matches(msg):
+                            return msg
+        finally:
             with self._lock:
-                for msg in reversed(self._messages):
-                    if str(msg.get(field, "")) == value:
-                        return msg
+                self._waiters = [(p, e) for p, e in self._waiters if e is not evt]
         return None
 
     def messages_for(self, resource_uuid: str) -> list[dict]:
@@ -180,7 +202,6 @@ def _create_order(
         plan=plan_url,
         limits=order_limits,
         attributes=attrs,
-        type_=RequestTypes.CREATE,
     )
     order = marketplace_orders_create.sync(client=client, body=body)
     return order.uuid.hex if hasattr(order.uuid, "hex") else str(order.uuid)
@@ -271,26 +292,53 @@ def _wait_for_qos(
     return last
 
 
-def _wait_for_resource_flags(
+def _settle_resource_flags(
     client,
+    policy_uuid: str,
     resource_uuid: str,
-    expected_paused: bool,
-    expected_downscaled: bool,
-    timeout: float = STOMP_WAIT_TIMEOUT,
+    expected: tuple[bool, bool],
+    *,
+    timeout: float = 90.0,
+    hold: float = 5.0,
+    reeval_gap: float = 6.0,
 ) -> tuple[bool, bool]:
-    """Poll the resource until paused/downscaled settle to the expected values.
+    """Drive the resource to ``expected`` (paused, downscaled) and confirm it holds.
 
-    The agent re-fetches live resource state when it processes a RESOURCE
-    event, so the QoS it writes reflects whatever Mastermind reports at that
-    instant. Asserting QoS while the flags are still flipping is racy — wait
-    for Mastermind to settle the resource first, then assert on the QoS.
+    A single ``/evaluate/`` call is not enough on its own: each ``set_usage``
+    write also kicks off an *asynchronous* policy-evaluation chain in Mastermind
+    (``process_component_usage_billing`` -> ``evaluate_slurm_resource_policy`` ->
+    ``evaluate_resource_against_policy``). One of those in-flight chains, spawned
+    by an earlier usage write, can land *after* the manual evaluate and flip the
+    flags back, so passively waiting for the flags to settle races the async
+    pipeline and flakes deterministically under CI load.
+
+    Instead we re-issue the evaluate whenever the flags drift from the target.
+    Re-evaluation reads the current usage under a row lock (Mastermind
+    serialises concurrent evaluations of the same resource), so once the finite
+    set of async chains from earlier usage writes has drained, our evaluate is
+    the last writer and the state converges. The manual evaluate does not itself
+    write ``ComponentUsage``, so it never spawns a new competing chain. We then
+    require the state to hold for ``hold`` seconds *without* re-evaluating,
+    proving the resource genuinely settled rather than momentarily flipping
+    under our command.
     """
     deadline = time.time() + timeout
+    stable_since = None
+    last_eval = 0.0
     flags = _resource_flags(client, resource_uuid)
     while time.time() < deadline:
         flags = _resource_flags(client, resource_uuid)
-        if flags == (expected_paused, expected_downscaled):
-            return flags
+        now = time.time()
+        if flags == expected:
+            if stable_since is None:
+                stable_since = now
+            elif now - stable_since >= hold:
+                return flags
+        else:
+            stable_since = None
+            if now - last_eval >= reeval_gap:
+                _evaluate_policy(client, policy_uuid, resource_uuid)
+                last_eval = now
         time.sleep(1)
     return flags
 
@@ -359,18 +407,23 @@ def qos_stomp_consumers(request, qos_stomp_offering, resource_capture):
         delegate=handlers.on_resource_message_stomp
     )
 
-    for conn, event_subscription, _offering in consumers:
-        observable_objects = getattr(event_subscription, "observable_objects", [])
-        for obj in observable_objects:
-            if obj.object_type == ObservableObjectTypeEnum.RESOURCE.value:
-                listener = conn.get_listener(WALDUR_LISTENER_NAME)
-                if listener:
-                    listener.on_message_callback = resource_handler
-                    logger.info(
-                        "Hooked RESOURCE event handler for offering %s",
-                        _offering.name,
-                    )
-                break
+    def capturing_router(frame, offering, user_agent, expose_backend_error_details=True):
+        # Unified queue: intercept RESOURCE by payload object_type, fall through
+        # to the agent's own router (ORDER etc.) for everything else.
+        if json.loads(frame.body).get("object_type") == ObservableObjectTypeEnum.RESOURCE.value:
+            resource_handler(frame, offering, user_agent, expose_backend_error_details)
+        else:
+            route_message(frame, offering, user_agent, expose_backend_error_details)
+
+    for conn, unified_queue, _offering in consumers:
+        listener = conn.get_listener(WALDUR_LISTENER_NAME)
+        if listener:
+            listener.on_message_callback = capturing_router
+            logger.info(
+                "Hooked RESOURCE capture on queue %s for offering %s",
+                unified_queue.queue_name,
+                _offering.name,
+            )
 
     consumers_map = {(qos_stomp_offering.name, qos_stomp_offering.uuid): consumers}
 
@@ -457,12 +510,27 @@ class TestQosStomp:
         _evaluate_policy(qos_stomp_client, s["policy_uuid"], s["resource_uuid"])
 
         # Mastermind flips paused=True → resource.save() → RESOURCE STOMP event.
-        msg = resource_capture.wait_for("resource_uuid", s["resource_uuid"])
-        assert msg is not None, (
-            f"No RESOURCE event received within {STOMP_WAIT_TIMEOUT}s after pausing"
+        msg = resource_capture.wait_for(
+            "resource_uuid",
+            s["resource_uuid"],
+            where=lambda m: m.get("paused") is True,
         )
-        assert msg.get("paused") is True, (
-            f"Expected paused=True in STOMP message, got {msg!r}"
+        assert msg is not None, (
+            f"No RESOURCE event with paused=True received within {STOMP_WAIT_TIMEOUT}s "
+            f"after pausing; events seen for this resource: "
+            f"{resource_capture.messages_for(s['resource_uuid'])!r}"
+        )
+
+        # Settle the flags to (paused, downscaled) before asserting QoS so the
+        # agent's STOMP-driven sync (which re-fetches live resource state) reads
+        # a stable pause rather than a value still flipping under the async
+        # evaluation chain. This also gives test_03 a deterministic baseline.
+        paused, downscaled = _settle_resource_flags(
+            qos_stomp_client, s["policy_uuid"], s["resource_uuid"], (True, True)
+        )
+        assert (paused, downscaled) == (True, True), (
+            f"Resource did not settle to paused+downscaled (paused={paused}, "
+            f"downscaled={downscaled}) after usage above the limit"
         )
 
         # The capture handler delegates to on_resource_message_stomp, which
@@ -506,17 +574,20 @@ class TestQosStomp:
             f"Expected paused=False in restore message, got {new_msg!r}"
         )
 
-        # Wait for Mastermind to actually settle the resource to unpaused +
-        # un-downscaled before asserting QoS. If it does not settle, the
-        # failure is a Mastermind re-pause, not an agent QoS-write bug — the
-        # message distinguishes the two.
-        paused, downscaled = _wait_for_resource_flags(
-            qos_stomp_client, s["resource_uuid"], False, False
+        # Drive the resource to unpaused + un-downscaled and confirm it holds
+        # before asserting QoS. Submitting usage=0 kicks off an async policy
+        # re-evaluation chain that races the manual evaluate above; a stale
+        # in-flight chain can re-pause the resource right after we restore it.
+        # _settle_resource_flags re-issues the restore evaluate until the flags
+        # stay put, so the assertion reflects the settled state rather than a
+        # transient mid-race read.
+        paused, downscaled = _settle_resource_flags(
+            qos_stomp_client, s["policy_uuid"], s["resource_uuid"], (False, False)
         )
         assert (paused, downscaled) == (False, False), (
             f"Resource did not settle to the restored state "
-            f"(paused={paused}, downscaled={downscaled}); Mastermind appears to "
-            "be re-pausing/re-downscaling rather than the agent failing to write QoS"
+            f"(paused={paused}, downscaled={downscaled}) even after repeated "
+            "re-evaluation; the async policy pipeline is not converging to usage=0"
         )
 
         qos = _wait_for_qos(qos_slurm_bin_path, s["backend_id"], "normal")
@@ -541,8 +612,10 @@ class TestQosStomp:
         if not s:
             pytest.skip("setup did not run")
 
-        # Baseline QoS should be "normal" from test_03.
-        qos_before = get_account_qos(qos_slurm_bin_path, s["backend_id"])
+        # Baseline QoS should be "normal" from test_03. Poll rather than assert
+        # immediately so any residual STOMP propagation lag from the restore
+        # does not cascade a spurious precondition failure into this test.
+        qos_before = _wait_for_qos(qos_slurm_bin_path, s["backend_id"], "normal", timeout=15)
         assert qos_before == "normal", (
             f"Precondition: expected QoS=normal before idempotency test, got {qos_before!r}"
         )
@@ -591,22 +664,16 @@ class TestQosStomp:
 
         # Terminate the resource via a TERMINATE order.
         try:
-            offering_url, plan_url = _offering_urls(qos_stomp_client, QOS_OFFERING_UUID)
-            res = marketplace_provider_resources_retrieve.sync(
-                uuid=s["resource_uuid"], client=qos_stomp_client
+            result = marketplace_resources_terminate.sync(
+                uuid=s["resource_uuid"],
+                client=qos_stomp_client,
+                body=ResourceTerminateRequest(),
             )
-            resource_url = res.url if not isinstance(res.url, type(UNSET)) else None
-            body = OrderCreateRequest(
-                offering=offering_url,
-                project=s["project_url"],
-                plan=plan_url,
-                attributes=GenericOrderAttributes(),
-                type_=RequestTypes.TERMINATE,
+            order_uuid = (
+                result.order_uuid.hex
+                if hasattr(result.order_uuid, "hex")
+                else str(result.order_uuid)
             )
-            if resource_url:
-                body.additional_properties["resource"] = resource_url
-            order = marketplace_orders_create.sync(client=qos_stomp_client, body=body)
-            order_uuid = order.uuid.hex if hasattr(order.uuid, "hex") else str(order.uuid)
             # The STOMP ORDER consumer processes the terminate order; poll only
             # (a manual processor would race it on set_state_done — 409).
             _wait_for_order_done(qos_stomp_client, order_uuid, timeout=60)

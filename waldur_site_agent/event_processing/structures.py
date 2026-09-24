@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 import stomp
-from waldur_api_client.models.event_subscription import EventSubscription
 
 from waldur_site_agent.common import structures as common_structures
+from waldur_site_agent.common.structures import UnifiedQueue
+
+__all__ = ["UnifiedQueue"]  # re-exported for event-processing callers
 
 
 class ObservableObject(TypedDict):
@@ -26,8 +28,9 @@ class ObservableObject(TypedDict):
 # A tuple of offering name and UUID used as a key for connection mapping.
 StompConsumerKey = tuple[str, str]
 
-# A tuple containing STOMP connection, subscription, and offering information.
-StompConsumer = tuple[stomp.WSStompConnection, EventSubscription, common_structures.Offering]
+# A tuple containing STOMP connection, unified-queue descriptor, and offering.
+# Unified path: exactly one StompConsumer per offering (one queue, all types).
+StompConsumer = tuple[stomp.WSStompConnection, UnifiedQueue, common_structures.Offering]
 
 StompConsumersMap = dict[StompConsumerKey, list[StompConsumer]]
 
@@ -42,6 +45,8 @@ class UserRoleMessage(TypedDict):
         project_name (str): The name of the project where the role change occurred.
         role_name (str): The name of the role that was granted or revoked.
         granted (bool, optional): True if the role was granted, False if it was revoked.
+        resource_uuid (str, optional): When set (resource-scoped resync trigger),
+            limits the sync to this resource instead of the whole project.
     """
 
     user_uuid: str | None
@@ -50,6 +55,7 @@ class UserRoleMessage(TypedDict):
     project_name: str
     role_name: str
     granted: bool | None
+    resource_uuid: str | None
 
 
 class ResourceMessage(TypedDict):
@@ -109,6 +115,27 @@ class PeriodicLimitsMessage(TypedDict):
     action: str
     settings: dict
     timestamp: str
+
+
+class ApiKeyRotationMessage(TypedDict):
+    """A command to reconcile one of a resource's API keys.
+
+    Attributes:
+        action (str): ``rotate`` — the key count is fixed at provisioning
+        resource_uuid (str): UUID of the resource in Waldur
+        resource_backend_id (str): backend id the key client-ids derive from
+        api_key_uuid (Optional[str]): the ResourceApiKey to act on
+        client_id (Optional[str]): the key's gateway client-id
+
+    The two key fields are optional because this is parsed straight from an
+    untrusted frame body; the handler rejects a command missing either.
+    """
+
+    action: str
+    resource_uuid: str
+    resource_backend_id: str
+    api_key_uuid: Optional[str]
+    client_id: Optional[str]
 
 
 class OfferingUserMessage(TypedDict):

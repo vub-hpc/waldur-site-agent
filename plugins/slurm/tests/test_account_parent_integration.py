@@ -35,8 +35,6 @@ TimeEngine = pytest.importorskip("emulator.core.time_engine").TimeEngine
 
 pytestmark = pytest.mark.integration
 
-_CONTROL_FLAGS = frozenset({"--parsable2", "--noheader", "--immediate"})
-
 
 @pytest.fixture
 def client(tmp_path):
@@ -56,8 +54,9 @@ def client(tmp_path):
 
     def _route(argv, silent=False):
         assert Path(argv[0]).name == "sacctmgr"
-        filtered = [a for a in argv[1:] if a not in _CONTROL_FLAGS]
-        output = sacctmgr.handle_command(filtered)
+        # Strip the binary prefix; the emulator follows --parsable2/--noheader
+        # like real SLURM, so flags are passed through.
+        output = sacctmgr.handle_command(list(argv[1:]))
         if sacctmgr.exit_code != 0:
             raise BackendError(output)
         return output
@@ -92,10 +91,12 @@ class TestSetAccountParent:
         assert client.get_account_parent("p-proj") == "c-new"
 
     def test_reparent_to_same_parent_is_a_noop(self, client):
-        # Real sacctmgr prints "  Nothing modified" to stdout and exits 0 for
-        # a no-op reparent (SLURM account_functions.c sets only a local rc;
-        # emulator >= 0.6.0 matches this). No BackendError must be raised.
-        assert "Nothing modified" in client.set_account_parent("p-proj", "c-org")
+        # Real sacctmgr prints "  Nothing modified" to stdout but exits 1 for a
+        # no-op reparent: account_functions.c:726-729 returns SLURM_ERROR, and
+        # sacctmgr.c:982-984 maps a non-SUCCESS error_code to exit_code=1.
+        # _execute_command swallows exactly this case and returns "" — no
+        # BackendError, because the desired parent is already in place.
+        assert client.set_account_parent("p-proj", "c-org") == ""
         assert client.get_account_parent("p-proj") == "c-org"
 
     def test_reparent_to_missing_parent_raises(self, client):
@@ -116,3 +117,30 @@ class TestSyncResourceProjectIsIdempotent:
         assert before == "c-org"
         if client.get_account_parent("p-proj") != "c-org":  # pragma: no cover
             client.set_account_parent("p-proj", "c-org")
+
+
+class TestAccountCaseInsensitivity:
+    """A project whose Waldur name has capital letters must still be matched.
+
+    Slurm stores account names lower-cased, so ``get_account_parent`` reads
+    back a folded name while the Waldur backend_id keeps the original case.
+    The emulator (>=0.8.0, pinned in this plugin's dev deps) reproduces that
+    folding, so these exercise the real mismatch end-to-end rather than the
+    hand-mocked output of the unit tests.
+    """
+
+    def test_get_account_parent_matches_mixed_case_backend_id(self, client):
+        # Created as 2026_00A; Slurm (and the emulator) store it as 2026_00a.
+        client._emulator.handle_command(["add", "account", "2026_00A", "parent=c-org"])
+        assert client.get_account_parent("2026_00A") == "c-org"
+
+    def test_no_spurious_reparent_for_correctly_parented_mixed_case_account(self, client):
+        # The production symptom: the buggy exact-match saw no parent for a
+        # capitalised project every cycle and reissued a reparent that Slurm
+        # rejected. With case-insensitive matching the parent is detected, so
+        # a redundant set_account_parent to the same (already-correct) parent
+        # is a no-op that does not raise.
+        client._emulator.handle_command(["add", "account", "2026_00A", "parent=c-org"])
+        assert client.get_account_parent("2026_00A") == "c-org"
+        assert client.set_account_parent("2026_00A", "c-org") == ""
+        assert client.get_account_parent("2026_00A") == "c-org"

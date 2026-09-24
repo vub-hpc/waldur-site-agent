@@ -11,12 +11,24 @@ management across different agent components and backend plugins.
 
 from __future__ import annotations
 
-from enum import Enum
-
 # Import after to avoid circular imports
+import logging
+import zoneinfo
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class AccountingType(Enum):
@@ -75,20 +87,14 @@ class BackendComponent(BaseModel):
     description: Optional[str] = Field(default=None, description="Description of the component")
     min_value: Optional[int] = Field(default=None, description="Minimum allowed value")
     max_value: Optional[int] = Field(default=None, description="Maximum allowed value")
-    max_available_limit: Optional[int] = Field(
-        default=None, description="Maximum available limit"
-    )
+    max_available_limit: Optional[int] = Field(default=None, description="Maximum available limit")
     default_limit: Optional[int] = Field(default=None, description="Default limit value")
     limit_period: Optional[str] = Field(
         default=None, description="Limit period: annual, month, quarterly, total"
     )
     article_code: Optional[str] = Field(default=None, description="Article code for billing")
-    is_boolean: Optional[bool] = Field(
-        default=None, description="Whether the component is boolean"
-    )
-    is_prepaid: Optional[bool] = Field(
-        default=None, description="Whether the component is prepaid"
-    )
+    is_boolean: Optional[bool] = Field(default=None, description="Whether the component is boolean")
+    is_prepaid: Optional[bool] = Field(default=None, description="Whether the component is prepaid")
     min_prepaid_duration: Optional[int] = Field(
         default=None, description="Minimum prepaid duration in months"
     )
@@ -114,6 +120,27 @@ class BackendComponent(BaseModel):
         return self.model_dump(exclude_unset=True, mode="json")
 
 
+def normalize_backend_components(
+    components: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Normalize backend components to plain dicts for BaseBackend compatibility.
+
+    Accepts ``BackendComponent`` instances, other pydantic models, or dicts (e.g.
+    from ``model_copy``) and returns a ``name -> dict`` mapping.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for name, component in components.items():
+        if isinstance(component, BackendComponent):
+            result[name] = component.to_dict()
+        elif isinstance(component, BaseModel):
+            result[name] = component.model_dump()
+        elif isinstance(component, dict):
+            result[name] = component
+        else:
+            result[name] = dict(component)
+    return result
+
+
 class Offering(BaseModel):
     """Configuration structure for a Waldur marketplace offering.
 
@@ -135,12 +162,22 @@ class Offering(BaseModel):
         membership_sync_backend: Backend name for membership synchronization
         reporting_backend: Backend name for usage reporting
         username_management_backend: Backend name for username management
+        preserve_unmanaged_backend_users: Keep backend users who were never offering users
     """
 
     name: str = Field(..., description="Human-readable name for the offering")
     waldur_api_url: str = Field(..., description="Base URL for the Waldur API endpoint")
-    waldur_api_token: str = Field(..., description="Authentication token for Waldur API")
+    waldur_api_token: str = Field(default="", description="Authentication token for Waldur API")
     waldur_offering_uuid: str = Field(..., description="UUID of the offering in Waldur")
+
+    # OIDC authentication (used when waldur_api_token is blank)
+    oidc_token_url: Optional[str] = Field(default=None, description="OIDC token endpoint URL")
+    oidc_client_id: Optional[str] = Field(
+        default=None, description="OIDC client ID for token requests"
+    )
+    oidc_client_secret: Optional[str] = Field(
+        default=None, description="OIDC client secret for obtaining access tokens"
+    )
 
     # Backend configuration
     backend_type: str = Field(..., description="Backend type identifier")
@@ -154,6 +191,11 @@ class Offering(BaseModel):
     # Event processing
     websocket_use_tls: bool = Field(default=True, description="Use TLS for websocket connections")
     stomp_enabled: bool = Field(default=False, description="Enable STOMP event processing")
+    stomp_membership_sync_enabled: Optional[bool] = Field(
+        default=None,
+        description="Use STOMP for membership sync; defaults to stomp_enabled. "
+        "Set to false to keep HTTP polling for membership sync even when stomp_enabled=true.",
+    )
     stomp_ws_host: Optional[str] = Field(default=None, description="STOMP WebSocket host")
     stomp_ws_port: Optional[int] = Field(default=None, description="STOMP WebSocket port")
     stomp_ws_path: Optional[str] = Field(default=None, description="STOMP WebSocket path")
@@ -175,7 +217,63 @@ class Offering(BaseModel):
     username_reconciliation_enabled: bool = Field(
         default=False, description="Enable periodic username reconciliation from target backend"
     )
+    preserve_unmanaged_backend_users: bool = Field(
+        default=False,
+        description=(
+            "If False (default), membership sync removes any backend user who is not "
+            "on the Waldur resource team. If True, users Waldur has ever known as "
+            "offering users of this offering (any state, including DELETED and "
+            "restricted) are removed once they leave the team; accounts Waldur has "
+            "never seen are kept. Applies to local-username backends; ignored for "
+            "identity-bridge / federation."
+        ),
+    )
     verify_ssl: bool = Field(default=True, description="Verify SSL certificates")
+    omit_anomalous_usage_components: bool = Field(
+        default=False,
+        description=(
+            "If False (default), a decreasing component blocks the whole set_usage "
+            "payload. If True, only the decreasing components are omitted and the "
+            "rest are still reported. Use True for backends whose meters are "
+            "independent (e.g. Waldur-to-Waldur)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_auth_config(self) -> Offering:
+        """Validate that either a static token or full OIDC config is provided."""
+        has_token = bool(self.waldur_api_token)
+        has_oidc = all([self.oidc_token_url, self.oidc_client_id, self.oidc_client_secret])
+        if not has_token and not has_oidc:
+            msg = (
+                "Either waldur_api_token or all of oidc_token_url, "
+                "oidc_client_id, oidc_client_secret must be set"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def warn_on_orphaned_stomp_membership_sync(self) -> Offering:
+        """Warn when membership sync is configured into a state where nothing runs it.
+
+        stomp_membership_sync_enabled=True tells the polling agent that STOMP owns
+        membership sync, so it skips HTTP polling.  But the STOMP consumers are
+        started only when stomp_enabled is True, so with stomp_enabled=False no
+        component performs membership sync at all and the offering silently stops
+        syncing team members.
+        """
+        if self.stomp_membership_sync_enabled is True and not self.stomp_enabled:
+            logger.warning(
+                "MISCONFIGURATION for offering '%s': stomp_membership_sync_enabled=true "
+                "but stomp_enabled=false. Membership sync will NOT run at all -- the "
+                "polling agent skips it (it assumes STOMP owns it) and the STOMP "
+                "consumers are never started (they require stomp_enabled=true). "
+                "Team members will stop being synced to the backend. "
+                "Fix: set stomp_enabled=true to use event-based membership sync, or "
+                "remove stomp_membership_sync_enabled to fall back to HTTP polling.",
+                self.name,
+            )
+        return self
 
     @field_validator("waldur_api_url")
     @classmethod
@@ -186,6 +284,15 @@ class Offering(BaseModel):
             raise ValueError(msg)
         if not v.endswith("/"):
             v = v + "/"
+        return v
+
+    @field_validator("oidc_token_url")
+    @classmethod
+    def validate_oidc_token_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate that oidc_token_url is a valid HTTP/HTTPS URL when set."""
+        if v is not None and not v.startswith(("http://", "https://")):
+            msg = "oidc_token_url must start with http:// or https://"
+            raise ValueError(msg)
         return v
 
     @field_validator("backend_type")
@@ -213,17 +320,7 @@ class Offering(BaseModel):
     @property
     def backend_components_dict(self) -> dict[str, dict[str, Any]]:
         """Convert backend components to dictionary format for BaseBackend compatibility."""
-        result = {}
-        for name, component in self.backend_components.items():
-            if isinstance(component, BackendComponent):
-                result[name] = component.to_dict()
-            elif isinstance(component, dict):
-                # Handle case where component is still a dict (e.g., from model_copy)
-                result[name] = component
-            else:
-                # Fallback - convert to dict
-                result[name] = dict(component)
-        return result
+        return normalize_backend_components(self.backend_components)
 
 
 class AgentMode(Enum):
@@ -350,6 +447,23 @@ class WaldurAgentConfiguration(BaseModel):
         """Legacy property for backward compatibility."""
         return self.offerings
 
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        """Reject a timezone the billing period cannot be computed in.
+
+        The croit backend's month boundary falls back to UTC on an unparseable
+        value while the reporting processor's clock falls back to naive system
+        local time. Near a month boundary those two disagree about which month it
+        is, so an accepted typo files a whole period's usage against the wrong one.
+        """
+        try:
+            zoneinfo.ZoneInfo(v)
+        except Exception as exc:
+            msg = f"Unknown timezone {v!r}: {exc}"
+            raise ValueError(msg) from exc
+        return v
+
 
 class RootConfiguration(BaseModel):
     """Root configuration model for parsing YAML configuration files.
@@ -473,9 +587,43 @@ class RootConfiguration(BaseModel):
             log_shipping=self.log_shipping,
         )
 
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        """Reject a timezone the billing period cannot be computed in.
+
+        The croit backend's month boundary falls back to UTC on an unparseable
+        value while the reporting processor's clock falls back to naive system
+        local time. Near a month boundary those two disagree about which month it
+        is, so an accepted typo files a whole period's usage against the wrong one.
+        """
+        try:
+            zoneinfo.ZoneInfo(v)
+        except Exception as exc:
+            msg = f"Unknown timezone {v!r}: {exc}"
+            raise ValueError(msg) from exc
+        return v
+
 
 class AccountType(Enum):
     """Enumeration of service account types for the Waldur Site Agent."""
 
     SERVICE_ACCOUNT = "service_account"
     COURSE_ACCOUNT = "course_account"
+
+
+@dataclass
+class UnifiedQueue:
+    """Descriptor of a single unified consumer queue (``consumer_{uuid}``).
+
+    Returned by ``AgentIdentityManager.register_queue()``. One queue per agent
+    identity receives ALL observable object types; the object type of each
+    message is carried in the payload, so routing happens per-message rather
+    than per-queue (unlike the legacy per-object-type subscription queues).
+    """
+
+    queue_name: str
+    rmq_username: str
+    vhost: str
+    observable_object_types: list[str] = field(default_factory=list)
+    agent_identity_uuid: str = ""
