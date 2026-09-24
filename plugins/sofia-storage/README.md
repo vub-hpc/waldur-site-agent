@@ -84,6 +84,11 @@ is enabled, so usage may go down between reports.
 **Delete**: terminating the resource does not remove the fileset or its
 data — the block quota is zeroed so the resource stops consuming quota.
 
+**Re-create**: a terminated resource is re-created on the same backend ID.
+The existing fileset is detected and reused — only the quota is
+re-established to the new ordered limit (plus the VSC group update and
+home-directory checks of the normal create path).
+
 ## Installation
 
 The plugin is a member of the `waldur-site-agent` uv workspace:

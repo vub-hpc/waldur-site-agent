@@ -123,7 +123,12 @@ class SofiaStorageBackend(BaseBackend):
         resource_backend_id: str,
         user_context: Optional[dict] = None,
     ) -> BackendResourceInfo:
-        """Create GPFS fileset for resource"""
+        """Create GPFS fileset for resource.
+
+        Termination never removes the fileset, so when it already exists
+        (e.g. a resource re-created after termination) only its quota is
+        re-established.
+        """
         if user_context is None:
             logger.error("Cannot create storage resource without Waldur user context")
             return
@@ -133,28 +138,31 @@ class SofiaStorageBackend(BaseBackend):
         # Actions prior to resource creation
         self._pre_create_resource(waldur_resource, user_context)
 
-        # Create resource with specific ID
+        # Create the fileset only when it does not exist yet
         project_backend_id = self._get_project_backend_id(waldur_resource.project_slug)
-        if not self._create_backend_resource(
+        if self._create_backend_resource(
             resource_backend_id,
             waldur_resource.name,
             project_backend_id,
         ):
-            raise BackendError(f"Failed to create backend resource with ID: {resource_backend_id}")
+            # Create fileset for project
+            project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
+            project_mods = self._get_project_moderators(user_context)
+            _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
 
-        # Create fileset for project
-        project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
-        project_mods = self._get_project_moderators(user_context)
-        _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
-
-        try:
-            self.client.sudo_waldur_make_project_vsc(
-                project_dir=resource_backend_id,
-                owner_uid=project_owner_uid,
-                owner_gid=project_gid,
+            try:
+                self.client.sudo_waldur_make_project_vsc(
+                    project_dir=resource_backend_id,
+                    owner_uid=project_owner_uid,
+                    owner_gid=project_gid,
+                )
+            except Exception as err:
+                raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
+        else:
+            logger.info(
+                "Storage resource %s already exists, skipping fileset creation",
+                resource_backend_id,
             )
-        except Exception as err:
-            raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
 
         # Set fileset limits
         resource_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
