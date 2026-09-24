@@ -1,8 +1,18 @@
-# Waldur Site Agent
+# Waldur Site Agent - sofia storage plugin
 
 A stateless Python application that synchronizes data between Waldur Mastermind and service provider
 backends. Manages account creation, usage reporting, and membership synchronization across different cluster
 management systems.
+
+This fork contains [plugins/sofia-storage], a plugin with a specific interface
+to the scratch storage backend on the **sofia** cluster. The site agent can
+handle the following actions for resources in waldur for `sofia-storage`:
+
+* create/update VSC user groups for the resource
+* create/update fileset on the GPFS storage for the resource
+* set/update permissions on the local mount of the resource
+* set/update quotas of the resource
+* report usage data on the resource
 
 ## Architecture
 
