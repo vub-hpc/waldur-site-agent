@@ -27,6 +27,9 @@ class SofiaStorageBackend(BaseBackend):
       fileset name = {resource_backend_id}
     - mount fileset in local storage:
       mount path = {storage_path}/{resource_backend_id}
+    - enforce a single active storage resource per project: a new order
+      for a project with an active resource fails, while an order for a
+      terminated project re-activates the existing fileset
     """
     supports_decreasing_usage = True
 
@@ -125,50 +128,87 @@ class SofiaStorageBackend(BaseBackend):
     ) -> BackendResourceInfo:
         """Create GPFS fileset for resource.
 
-        Termination never removes the fileset, so when it already exists
-        (e.g. a resource re-created after termination) only its quota is
-        re-established.
+        Only one active storage resource is allowed per project:
+
+        - a request for a project that already has an active resource fails;
+        - a request for a project whose resource was terminated re-activates
+          the existing fileset (termination never removes filesets);
+        - a request for a project without any fileset creates a new one.
         """
         if user_context is None:
             logger.error("Cannot create storage resource without Waldur user context")
             return
+
+        # Storage resources always run with a quota: reject orders without a
+        # positive storage limit before any backend action is taken.
+        order_limits = waldur_resource.limits.to_dict() if waldur_resource.limits else {}
+        storage_limit = order_limits.get(OFFERING_COMPONENT)
+        if storage_limit is None or float(storage_limit) <= 0:
+            raise BackendError(
+                f"Cannot create storage resource {waldur_resource.name}: the order has no positive "
+                f"'{OFFERING_COMPONENT}' limit. Storage resources are always created with a quota."
+            )
 
         logger.info("Creating sofia storage resource: %s (id: %s)", waldur_resource.name, resource_backend_id)
 
         # Actions prior to resource creation
         self._pre_create_resource(waldur_resource, user_context)
 
-        # Create the fileset only when it does not exist yet
-        project_backend_id = self._get_project_backend_id(waldur_resource.project_slug)
-        if self._create_backend_resource(
-            resource_backend_id,
-            waldur_resource.name,
-            project_backend_id,
-        ):
-            # Create fileset for project
-            project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
+        project_group, project_gid = self.vsc_client.get_project_group_ids(waldur_resource.project_slug)
+
+        # The project's filesets, keyed by name with their block quota. A
+        # quota of 0 marks a terminated resource (see list_project_filesets).
+        project_filesets = self.client.list_project_filesets(project_gid)
+
+        if resource_backend_id in project_filesets:
+            # Re-activate the fileset of this resource (e.g. after termination)
+            target_backend_id = resource_backend_id
+            logger.info(
+                "Storage resource %s already exists, skipping fileset creation",
+                target_backend_id,
+            )
+        elif any(quota > 0 for quota in project_filesets.values()):
+            active = ", ".join(sorted(name for name, quota in project_filesets.items() if quota > 0))
+            raise BackendError(
+                f"Project {waldur_resource.project_slug} already has an active storage resource "
+                f"({active}). Only one active storage resource per project is allowed; "
+                "terminate it before ordering a new one."
+            )
+        elif len(project_filesets) == 1:
+            # Re-activate the project's terminated fileset instead of
+            # creating a new one
+            target_backend_id = next(iter(project_filesets))
+            logger.info(
+                "Re-activating terminated storage resource %s of project %s",
+                target_backend_id,
+                waldur_resource.project_slug,
+            )
+        elif len(project_filesets) > 1:
+            raise BackendError(
+                f"Project {waldur_resource.project_slug} has multiple terminated storage resources "
+                f"({', '.join(sorted(project_filesets))}). Remove the unused filesets manually "
+                "before ordering a new one."
+            )
+        else:
+            # New fileset for the project
+            target_backend_id = resource_backend_id
             project_mods = self._get_project_moderators(user_context)
             _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
 
             try:
                 self.client.sudo_waldur_make_project_vsc(
-                    project_dir=resource_backend_id,
+                    project_dir=target_backend_id,
                     owner_uid=project_owner_uid,
                     owner_gid=project_gid,
                 )
             except Exception as err:
-                raise BackendError(f"Failed to make storage directory for resource {resource_backend_id}: {err}")
-        else:
-            logger.info(
-                "Storage resource %s already exists, skipping fileset creation",
-                resource_backend_id,
-            )
+                raise BackendError(f"Failed to make storage directory for resource {target_backend_id}: {err}")
 
         # Set fileset limits
-        resource_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
+        resource_limits = self._setup_resource_limits(target_backend_id, waldur_resource)
 
         backend_resource_info = BackendResourceInfo(
-            backend_id=resource_backend_id,
+            backend_id=target_backend_id,
             limits=resource_limits,
         )
         self.post_create_resource(backend_resource_info, waldur_resource, user_context)
@@ -275,24 +315,41 @@ class SofiaStorageBackend(BaseBackend):
     def _collect_resource_limits(
         self, waldur_resource: WaldurResource
     ) -> tuple[dict[str, int], dict[str, int]]:
-        """Collect and convert limits."""
-        backend_limits = {}
-        waldur_limits = {}
+        """Collect and convert limits.
 
+        A positive 'storage' limit is mandatory: storage resources always
+        run with a quota, so a missing or zero limit is rejected rather
+        than defaulted.
+        """
         resource_limits = waldur_resource.limits.to_dict() if waldur_resource.limits else {}
+        limit_value = resource_limits.get(OFFERING_COMPONENT)
+        if limit_value is None or float(limit_value) <= 0:
+            raise BackendError(
+                f"Resource {waldur_resource.name} has no positive '{OFFERING_COMPONENT}' limit; "
+                "storage resources must be ordered with a storage quota."
+            )
 
-
-        if OFFERING_COMPONENT in resource_limits:
-            limit_value = resource_limits[OFFERING_COMPONENT]
-            backend_limits[OFFERING_COMPONENT] = int(limit_value * self.unit_factor)
-            waldur_limits[OFFERING_COMPONENT] = limit_value
-        else:
-            # Default limit if not set in Waldur
-            comp_data = self.backend_components[OFFERING_COMPONENT]
-            backend_limits[OFFERING_COMPONENT] = comp_data.get("limit", 0)
-            waldur_limits[OFFERING_COMPONENT] = comp_data.get("limit", 0)
+        backend_limits = {OFFERING_COMPONENT: int(limit_value * self.unit_factor)}
+        waldur_limits = {OFFERING_COMPONENT: limit_value}
 
         return backend_limits, waldur_limits
+
+    def set_resource_limits(
+        self, resource_backend_id: str, limits: dict[str, int]
+    ) -> Optional[str]:
+        """Set limits for the resource.
+
+        Limit updates must keep a positive storage quota: the only
+        sanctioned zero is termination, which zeroes the quota through the
+        client directly.
+        """
+        storage_limit = limits.get(OFFERING_COMPONENT)
+        if storage_limit is None or float(storage_limit) <= 0:
+            raise BackendError(
+                f"Refusing to set a zero or missing storage quota on {resource_backend_id}: "
+                "storage resources must keep a positive quota. Terminate the resource instead."
+            )
+        return super().set_resource_limits(resource_backend_id, limits)
 
     def get_resource_metadata(self, resource_backend_id: str) -> dict:
         """Return metadata for resource."""

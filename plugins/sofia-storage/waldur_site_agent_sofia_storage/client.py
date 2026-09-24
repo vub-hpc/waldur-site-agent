@@ -87,6 +87,32 @@ class SofiaStorageClient(BaseClient):
         logger.info(f"Creating fileset {fileset_name} at: {fileset_path}")
         self.operator.make_fileset(fileset_path, fileset_name)
 
+    def list_project_filesets(self, project_gid: int, silent: bool = False) -> dict[str, int]:
+        """Return the filesets of the project owning the given GID.
+
+        Filesets are identified by group ownership: on creation each fileset
+        is chowned to the project's VSC group (see set_project_owner).
+
+        Returns:
+            Mapping of fileset name to its block quota in bytes. A quota of
+            0 marks a terminated resource, since termination zeroes (but
+            never removes) the fileset quota.
+        """
+        filesets: dict[str, int] = {}
+        for name in os.listdir(self.storage_path):
+            path = os.path.join(self.storage_path, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_gid != project_gid:
+                continue
+            _, block_limit = self.get_fileset_quota(name, silent=silent)
+            filesets[name] = block_limit
+        return filesets
+
     def _kb_to_bytes(self, kb_units: str | float | int) -> int:
         """Convert KB to bytes"""
         return int(float(kb_units) * 1024)

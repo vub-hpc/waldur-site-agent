@@ -27,6 +27,9 @@ For each `sofia_storage` resource in Waldur the agent can:
 - set/update the resource's block quota
 - add/remove users (VSC group membership)
 - report storage usage (fileset total and per user)
+- enforce a single **active** storage resource per project
+- require a positive storage quota — orders and limit updates without
+  one are rejected
 
 ## Naming
 
@@ -44,6 +47,10 @@ Example: project `my-project` with prefix `proj_` → VSC group
 ## Resource Lifecycle
 
 **Create** (`order_process` mode):
+
+The order must carry a positive `storage` limit — a storage resource
+always runs with a quota, so an order without one is rejected before
+any backend action is taken.
 
 1. The project's VSC group is created or updated with the current project
    team as members and the project `ADMIN`/`MANAGER` users as moderators,
@@ -84,10 +91,23 @@ is enabled, so usage may go down between reports.
 **Delete**: terminating the resource does not remove the fileset or its
 data — the block quota is zeroed so the resource stops consuming quota.
 
-**Re-create**: a terminated resource is re-created on the same backend ID.
-The existing fileset is detected and reused — only the quota is
-re-established to the new ordered limit (plus the VSC group update and
-home-directory checks of the normal create path).
+**One active resource per project**: a project may have at most one
+active storage resource. The project's filesets are identified by
+ownership — each fileset is chowned to the project's VSC group when it
+is created — and a zero block quota marks a terminated resource. Since
+creation and limit updates must keep a positive quota, termination is
+the only way a fileset's quota reaches zero. Consequences:
+
+- a new order for a project that already has an **active** resource
+  **fails**, naming the active resource in the order error;
+- a new order for a project whose resource was **terminated**
+  **re-activates the old fileset**: no new fileset is created, the
+  quota is re-established to the new ordered limit, and the old
+  backend ID is reported back to Waldur — whether Waldur re-uses the
+  old resource row or orders a new one for the project;
+- a project without any fileset gets a new one (normal create path);
+- a project left with **multiple terminated** filesets (legacy state)
+  fails until the unused filesets are removed manually.
 
 ## Installation
 
@@ -155,7 +175,10 @@ in `backend_components`:
 - **`unit_factor`** — bytes per `measured_unit`. Ordered limits are
   multiplied by it before being applied to GPFS, and usage read from GPFS
   (in KB, converted to bytes) is divided by it before being reported.
-- **`limit`** — default applied when an order does not set one.
+- **`limit`** — not used as a fallback by this plugin: the order itself
+  must carry a positive `storage` limit, and zero-quota resources are
+  not allowed (creation and limit updates without a positive limit are
+  rejected).
 
 ## Standalone Scripts
 
