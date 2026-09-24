@@ -325,14 +325,22 @@ class SofiaStorageBackend(BaseBackend):
         report = {}
         for rbi in resource_backend_ids:
             rbi_usage = {}
-            res_data = self.client.collect_project_quotas(rbi)
+            try:
+                res_data = self.client.collect_project_quotas(rbi)
+            except Exception as err:
+                # A single failing resource must not discard the rest of a
+                # batched report.
+                logger.error("No usage report for storage resource %s: %s", rbi, err)
+                continue
+
             for entity, usage, _ in res_data:
                 rbi_entity_usage = float(usage) / self.unit_factor
 
                 if entity == "fileset":
+                    # fileset entity has total as name
                     rbi_entity_name = "TOTAL_ACCOUNT_USAGE"
                 else:
-                    # username
+                    # user entity has username as name
                     rbi_entity_name = entity
 
                 rbi_usage.update({
