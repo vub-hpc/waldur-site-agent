@@ -386,12 +386,24 @@ class SofiaStorageBackend(BaseBackend):
         return super().set_resource_limits(resource_backend_id, limits)
 
     def get_resource_metadata(self, resource_backend_id: str) -> dict:
-        """Return metadata for resource."""
+        """Return the applied storage quota of the resource as metadata.
+
+        Reported in the offering unit (GiB), like the resource limits in
+        Waldur. Only the limit is reported: usage changes constantly and
+        would trigger a metadata rewrite on every membership sync, and it
+        is already covered by the usage reports.
+        """
         try:
-            quota = self.client.get_quota(resource_backend_id)
-            return quota
+            _, block_limit = self.client.get_fileset_quota(
+                fileset_name=resource_backend_id, silent=True
+            )
         except Exception:
+            logger.debug(
+                "No quota available for storage resource %s; returning empty metadata",
+                resource_backend_id,
+            )
             return {}
+        return {f"{OFFERING_COMPONENT}_limit": round(block_limit / self.unit_factor, 2)}
 
     # Required by BaseBackend interface
     def downscale_resource(self, resource_backend_id: str) -> bool: return True

@@ -69,7 +69,8 @@ any backend action is taken.
 
 **Add/remove user** (`membership_sync` mode): the user is added to or
 removed from the project's VSC group — access to the fileset follows group
-membership.
+membership. The applied storage quota is also synced to Waldur as resource
+backend metadata (`storage_limit`, in the offering unit).
 
 **Usage** (`report` mode): the fileset total and each member's usage are
 read with `mmlsquota` and reported for the `storage` component:
