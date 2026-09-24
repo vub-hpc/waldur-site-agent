@@ -50,7 +50,13 @@ class VscBackend:
     def get_project_group_ids(self, project_slug: str) -> dict | None:
         """Get IDs of VSC group of given project"""
         group_name = self.project_group_name(project_slug)
-        group_account = self.client.get_group(group_name)
+        try:
+            group_account = self.client.get_group(group_name)
+        except HTTPError as err:
+            raise BackendError(
+                f"Failed to retrieve information of VSC group {group_name} due to HTTP error: "
+                f"{err.reason} ({err.code})"
+            )
         return group_account.vsc_id, group_account.vsc_id_number
 
     def get_project_group_members(self, project_slug: str) -> list:
@@ -143,15 +149,44 @@ class VscBackend:
 
 
     def add_user_to_project(self, project_slug: str, username: str) -> bool:
-        """ Add user to VSC group of given project """
-        group_name, group_gid = self.get_project_group_ids(project_slug)
+        """Add user to VSC group of given project.
+
+        Raises BackendError when the add failed; callers (the core
+        membership sync) only catch BackendError, so no other exception
+        type may escape.
+        """
+        group_name, _ = self.get_project_group_ids(project_slug)
         logger.info(f"Adding member to VSC group {group_name}: {username}")
-        self.client.group[group_name].member[username].post(body={'vsc_id': username})
+        try:
+            self.client.group[group_name].member[username].post(body={'vsc_id': username})
+        except HTTPError as err:
+            raise BackendError(
+                f"Failed to add {username} to VSC group {group_name} due to HTTP error: "
+                f"{err.reason} ({err.code})"
+            )
         return True
 
     def remove_user_to_project(self, project_slug: str, username: str) -> bool:
-        """ Remove user from VSC group of given project """
-        group_name, group_gid = self.get_project_group_ids(project_slug)
+        """Remove user from VSC group of given project.
+
+        Returns True when the user no longer holds a membership: either
+        removed here, or already absent from the group. Callers release the
+        user's account on True, so a confirmed absence must not be reported
+        as "nothing to do" (False) -- that would keep a departed user's
+        account forever. A removal that actually failed raises BackendError.
+        """
+        group_name, _ = self.get_project_group_ids(project_slug)
         logger.info(f"Removing member from VSC group {group_name}: {username}")
-        self.client.group[group_name].member[username].delete()
+        try:
+            self.client.group[group_name].member[username].delete()
+        except HTTPError as err:
+            if err.code == 404:
+                logger.info(
+                    f"Member {username} is not in VSC group {group_name}; no membership left to remove"
+                )
+                return True
+            raise BackendError(
+                f"Failed to remove {username} from VSC group {group_name} due to HTTP error: "
+                f"{err.reason} ({err.code})"
+            )
         return True

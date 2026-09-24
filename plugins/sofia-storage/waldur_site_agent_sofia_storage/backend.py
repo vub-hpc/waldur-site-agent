@@ -259,19 +259,30 @@ class SofiaStorageBackend(BaseBackend):
         """Add user to VSC group of the resource"""
         del kwargs
 
-        project_slug = waldur_resource.project_slug
-        self.vsc_client.add_user_to_project(project_slug, username)
+        if self.vsc_client is None:
+            raise BackendError(
+                "Cannot add user to storage resource without VSC account page integration"
+            )
 
-        return True
+        project_slug = waldur_resource.project_slug
+        return self.vsc_client.add_user_to_project(project_slug, username)
 
     def remove_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
-        """Remove user from VSC group of the resource"""
+        """Remove user from VSC group of the resource.
+
+        Propagates the VscBackend result: True when the user no longer holds
+        a membership (removed, or already absent), BackendError when the
+        removal failed -- the core membership sync relies on exactly that.
+        """
         del kwargs
 
-        project_slug = waldur_resource.project_slug
-        self.vsc_client.remove_user_to_project(project_slug, username)
+        if self.vsc_client is None:
+            raise BackendError(
+                "Cannot remove user from storage resource without VSC account page integration"
+            )
 
-        return True
+        project_slug = waldur_resource.project_slug
+        return self.vsc_client.remove_user_to_project(project_slug, username)
 
     def _get_usage_report(self, resource_backend_ids: list[str]) -> dict:
         """Return usage report for the specified resources.
