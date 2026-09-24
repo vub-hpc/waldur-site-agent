@@ -22,7 +22,9 @@ class SofiaStorageBackend(BaseBackend):
     Sofia Storage backend
 
     - create VSC group for the project of the resource:
-      group name = {vsc_group_prefix}_{project_slug}
+      group name = {vsc_group_prefix}_{project_slug}; moderators are the
+      project moderators, or the first user of the team if the project
+      has none
     - create fileset in GPFS for this resource:
       fileset name = {resource_backend_id}
     - mount fileset in local storage:
@@ -93,6 +95,27 @@ class SofiaStorageBackend(BaseBackend):
             if user.role in ['PROJECT.ADMIN', 'PROJECT.MANAGER']
         ]
 
+    def _get_group_moderators(self, user_context: dict) -> list[str]:
+        """Return the moderators of the project's VSC group.
+
+        Projects may exist without moderators; in that case the first
+        user of the project team becomes the VSC group moderator.
+        """
+        project_mods = self._get_project_moderators(user_context)
+        if project_mods:
+            return project_mods
+
+        project_members = [user.username for user in user_context['team']]
+        if not project_members:
+            raise BackendError(
+                "Cannot create storage resource: the project has neither users nor moderators"
+            )
+        logger.info(
+            "Project has no moderators, using first user %s as VSC group moderator",
+            project_members[0],
+        )
+        return [project_members[0]]
+
     def _pre_create_resource(
         self,
         waldur_resource: WaldurResource,
@@ -106,8 +129,8 @@ class SofiaStorageBackend(BaseBackend):
         project_slug = waldur_resource.project_slug
         project_name = waldur_resource.project_name
         project_members = [user.username for user in user_context['team']]
-        project_mods = self._get_project_moderators(user_context)
-        logger.info(f"Sofia Storage Backend User context: {project_members} -- {project_mods}")
+        group_mods = self._get_group_moderators(user_context)
+        logger.info(f"Sofia Storage Backend User context: {project_members} -- {group_mods}")
 
         # Create VSC group for this project
         if not self.vsc_client:
@@ -117,7 +140,7 @@ class SofiaStorageBackend(BaseBackend):
             project_slug=project_slug,
             project_name=project_name,
             members=project_members,
-            moderators=project_mods,
+            moderators=group_mods,
         )
 
     def create_resource_with_id(
@@ -192,8 +215,8 @@ class SofiaStorageBackend(BaseBackend):
         else:
             # New fileset for the project
             target_backend_id = resource_backend_id
-            project_mods = self._get_project_moderators(user_context)
-            _, project_owner_uid = self.vsc_client.get_vsc_ids(project_mods[0])
+            group_mods = self._get_group_moderators(user_context)
+            _, project_owner_uid = self.vsc_client.get_vsc_ids(group_mods[0])
 
             try:
                 self.client.sudo_waldur_make_project_vsc(

@@ -232,7 +232,7 @@ class SofiaStorageClient(BaseClient):
         return block_usage, block_limit
 
     def collect_project_quotas(self, project: str) -> list:
-        """Launch standalone waldur_get_project_quota script"""
+        """Return fileset and user quotas"""
         project_quotas = []
         # fileset quota
         block_usage, block_limit = self.get_fileset_quota(project, silent=True)

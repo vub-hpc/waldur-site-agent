@@ -54,11 +54,14 @@ any backend action is taken.
 
 1. The project's VSC group is created or updated with the current project
    team as members and the project `ADMIN`/`MANAGER` users as moderators,
-   then added as a source of the configured VSC autogroup. A new group
-   cannot be created without at least one moderator.
+   then added as a source of the configured VSC autogroup. A project without
+   moderators is fine: the first user of the team becomes the group
+   moderator. Only a project without any users or moderators at all is
+   rejected.
 2. The fileset is created and owned by the project's VSC group (mode `0770`,
-   owner = the first moderator's VSC UID) through the
-   `waldur_make_project_vsc` script.
+   owner = the VSC UID of the first moderator, or of the first team user when
+   the project has no moderators) through the `waldur_make_project_vsc`
+   script.
 3. The ordered `storage` limit is applied as the fileset block quota (inode
    soft limit 1M) through the `waldur_set_project_quota` script.
 4. Home directories (mode `0700`) are created for every project member and
