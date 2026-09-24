@@ -1,110 +1,219 @@
-# VUB GPFS Storage Plugin for Waldur Site Agent
+# Sofia Storage Plugin for Waldur Site Agent
 
-A backend plugin for Waldur Site Agent that manages GPFS storage directly via CLI commands.
+A backend plugin for Waldur Site Agent managing scratch storage on the
+**sofia** cluster. Each Waldur marketplace resource becomes a GPFS fileset
+on the scratch filesystem, owned by a per-project VSC user group; quotas,
+membership and usage are kept in sync between Waldur and GPFS.
 
 > [!NOTE]
 > **Python 3.12+** is required for this plugin.
 
 ## Overview
 
-This plugin enables the Waldur Site Agent to manage GPFS storage resources. It implements the standard `BaseBackend` interface, allowing Waldur to:
-- Set and update GPFS quotas (blocks and inodes) for projects and users.
-- Report real-time usage metrics back to Waldur.
-- Perform health checks and diagnostics on the GPFS filesystem.
+`SofiaStorageBackend` (backend type `sofia_storage`) implements the standard
+`BaseBackend` interface on top of two integrations:
 
-Unlike previous iterations, this plugin is designed to run directly as part of the Waldur Site Agent and interacts with GPFS using system commands (`mmsetquota`, `mmrepquota`, etc.), removing the need for a separate API proxy.
+- **GPFS** — fileset creation, ownership and quotas via the VSC
+  `GpfsOperations` interface (`vsc-accountpage-clients`), plus quota and
+  usage queries with `mmlsquota`
+- **VSC account page** — one user group per Waldur project, created and
+  managed through the VSC account page API and used as the owning group of
+  the project fileset
 
-## Features
+For each `sofia_storage` resource in Waldur the agent can:
 
-- **Direct GPFS CLI Interaction**: Uses `mmsetquota`, `mmlsquota`, and `mmrepquota` for management.
-- **Quota Management**: Supports both block and inode quotas.
-- **Usage Reporting**: Automatically collects and reports usage per project/fileset.
-- **Zero-Proxy Architecture**: Simplified deployment as a standard Waldur Site Agent plugin.
-- **Custom Entrypoint**: Provides `waldur-vub-storage-plugin` command (alias to `waldur_site_agent`).
+- create/update the VSC user group of the resource's project
+- create the resource's GPFS fileset and set its ownership and permissions
+- set/update the resource's block quota
+- add/remove users (VSC group membership)
+- report storage usage (fileset total and per user)
+
+## Naming
+
+| Object          | Name |
+| --------------- | ---- |
+| VSC group       | `{vsc_group_prefix}{project_slug}` — dashes in the slug become underscores; a `b` is prepended to the prefix when it is set and does not already start with one |
+| GPFS fileset    | the resource backend ID |
+| Fileset path    | `{storage_path}/{resource_backend_id}` |
+| Home directory  | `{home_path}/{username}` |
+
+Example: project `my-project` with prefix `proj_` → VSC group
+`bproj_my_project`; a resource with backend ID `my-res-01` → fileset
+`my-res-01` at `/gpfs/my-res-01`.
+
+## Resource Lifecycle
+
+**Create** (`order_process` mode):
+
+1. The project's VSC group is created or updated with the current project
+   team as members and the project `ADMIN`/`MANAGER` users as moderators,
+   then added as a source of the configured VSC autogroup. A new group
+   cannot be created without at least one moderator.
+2. The fileset is created and owned by the project's VSC group (mode `0770`,
+   owner = the first moderator's VSC UID) through the
+   `waldur_make_project_vsc` script.
+3. The ordered `storage` limit is applied as the fileset block quota (inode
+   soft limit 1M) through the `waldur_set_project_quota` script.
+4. Home directories (mode `0700`) are created for every project member and
+   moderator through the `waldur_make_homedir_vsc` script.
+
+**Add/remove user** (`membership_sync` mode): the user is added to or
+removed from the project's VSC group — access to the fileset follows group
+membership.
+
+**Usage** (`report` mode): the fileset total and each member's usage are
+read with `mmlsquota` and reported for the `storage` component:
+
+```json
+{
+  "my-res-01": {
+    "TOTAL_ACCOUNT_USAGE": {
+      "storage": 50.0
+    },
+    "vsc12345": {
+      "storage": 12.5
+    }
+  }
+}
+```
+
+Values are in the offering's `measured_unit` (GPFS reports in KB; the plugin
+converts to bytes and divides by `unit_factor`). `supports_decreasing_usage`
+is enabled, so usage may go down between reports.
+
+**Delete**: terminating the resource does not remove the fileset or its
+data — the block quota is zeroed so the resource stops consuming quota.
 
 ## Installation
 
-This plugin is designed to be used within a `uv` workspace alongside `waldur-site-agent`.
+The plugin is a member of the `waldur-site-agent` uv workspace:
 
-```toml
-# In your main project's pyproject.toml or similar
-[tool.uv.sources]
-waldur-site-agent-vub-gpfs-storage = { path = "src/waldur-vub-storage-plugin" }
+```bash
+# from the repository root
+uv sync --all-packages
 ```
 
 ## Configuration
 
-In your `waldur-vub-storage-plugin-config.yaml`, configure the offering to use the `vub_gpfs` backend:
+Add an offering with `backend_type: sofia_storage` to the site agent
+configuration:
 
 ```yaml
 offerings:
-  - name: "VUB GPFS Storage"
-    backend_type: "vub_gpfs"
+  - name: "Sofia Scratch Storage"
+    waldur_api_url: "https://waldur.example.com/api/"
+    waldur_api_token: ""
+    waldur_offering_uuid: "..."
+
+    order_processing_backend: "sofia_storage"
+    membership_sync_backend: "sofia_storage"
+    reporting_backend: "sofia_storage"
+    backend_type: "sofia_storage"
+
     backend_settings:
-      storage_path: "/gpfs/storage1"
+      vsc_token: "your-oauth-token"     # required for resource creation
+      vsc_autogroup: "autogroup-name"   # VSC autogroup sourced from the project groups
+      vsc_group_prefix: "proj_"         # optional prefix for VSC group names (default: "")
+      storage_file_system: "gpfs"       # GPFS filesystem name (default: "gpfs")
+      storage_path: "/gpfs"             # local mount point of the scratch filesystem (default: "/gpfs")
+      home_path: "/home"                # home directory base path (default: "/home")
+
     backend_components:
       storage:
-        measured_unit: "GB"
-        accounting_type: "limit"
+        limit: 100
+        measured_unit: "GiB"
+        accounting_type: "usage"
         label: "Storage"
-        unit_factor: 1024  # If Waldur uses GB and GPFS expects MB
-      inodes:
-        measured_unit: "count"
-        accounting_type: "limit"
-        label: "Inodes"
-        unit_factor: 1
+        unit_factor: 1073741824  # bytes per measured unit (1073741824 for GiB, 1000000000 for GB)
 ```
 
-## Deployment
+### Backend settings
 
-Build and deploy using the Makefile from the repository root:
+- **`vsc_token`** — VSC account page access token. Effectively required:
+  without it, resource creation fails with
+  `Cannot create storage resource without VSC account page integration`.
+- **`vsc_autogroup`** — name of the VSC autogroup that each project group
+  is added to as a source.
+- **`vsc_group_prefix`** — optional prefix for VSC group names (see
+  [Naming](#naming)).
+- **`storage_file_system`** — GPFS filesystem name passed to the GPFS
+  commands (default `gpfs`).
+- **`storage_path`** — local mount point where the filesets appear
+  (default `/gpfs`).
+- **`home_path`** — base path for home directories (default `/home`).
 
-```bash
-# Build Docker image
-make build-storage IMAGE_TAG=development
+### Components
 
-# Deploy to target host
-# Deploy to target host
-make deploy-storage slurmdb11 IMAGE_TAG=development
-```
+The plugin manages a single component, **`storage`**, which must be present
+in `backend_components`:
 
-> [!IMPORTANT]
-> **GPFS Access**: The Docker Swarm service definition (`waldur-vub-storage-plugin.yml`) has volume mounts for GPFS binaries (`/usr/lpp/mmfs/bin`) commented out by default. 
-> To enable actual GPFS interaction in production, you must **uncomment these lines** in the compose file before deploying.
+- **`unit_factor`** — bytes per `measured_unit`. Ordered limits are
+  multiplied by it before being applied to GPFS, and usage read from GPFS
+  (in KB, converted to bytes) is divided by it before being reported.
+- **`limit`** — default applied when an order does not set one.
 
-The service runs as `waldur-vub-storage-plugin_waldur-vub-storage-plugin` in Docker Swarm.
+## Standalone Scripts
+
+Privileged operations run through three entry points of this package,
+installed to `/usr/local/bin` and invoked by the agent with `sudo`. Each
+script loads `/etc/waldur/waldur-site-agent-config.yaml` and picks the
+offering whose `backend_type` is `sofia_storage`:
+
+| Script | Arguments | Action |
+| ------ | --------- | ------ |
+| `waldur_make_homedir_vsc` | `<username>` | Create the home directory of a VSC user (username must start with `vsc`) |
+| `waldur_make_project_vsc` | `<project_dir> <owner_uid> <owner_gid>` | Create the fileset and set ownership (mode `0770`) |
+| `waldur_set_project_quota` | `<project_dir> <block_limit>` | Set the fileset block quota (inode soft limit 1M) |
 
 ## GPFS Commands Used
 
-- `mmlsfileset`: Used for health checks and listing.
-- `mmsetquota`: Used to set block and inode limits.
-- `mmlsquota`: Used to retrieve individual project/user limits and usage.
-- `mmrepquota`: Used for bulk usage reporting.
+- Fileset creation, ownership and quota setting: VSC `GpfsOperations`
+  interface (`vsc.filesystem.gpfs`)
+- `sudo /usr/lpp/mmfs/bin/mmlsquota` — `-Y -j <fileset>` for the fileset
+  quota/usage, `-Y -u <user> <fs>:<fileset>` for a user's quota/usage in a
+  fileset
+- `sudo getent group <group>` — members of the project's VSC group, read
+  from the local name service instead of querying the VSC account page
+
+## Requirements
+
+The agent must run on a host that:
+
+- has the GPFS client installed (`/usr/lpp/mmfs/bin`) and the scratch
+  filesystem mounted at `storage_path`
+- allows the agent user to run, without a password:
+  - `sudo /usr/local/bin/waldur_make_homedir_vsc *`
+  - `sudo /usr/local/bin/waldur_make_project_vsc *`
+  - `sudo /usr/local/bin/waldur_set_project_quota *`
+  - `sudo /usr/lpp/mmfs/bin/mmlsquota *`
+  - `sudo getent group *`
+- can resolve VSC identities (UID lookups for home directories)
+- can reach the VSC account page (`https://account.vscentrum.be/django/api`)
+
+## Package Structure
+
+```
+plugins/sofia-storage/
+├── pyproject.toml
+├── README.md
+└── waldur_site_agent_sofia_storage/
+    ├── __init__.py
+    ├── backend.py      # SofiaStorageBackend (BaseBackend implementation)
+    ├── client.py       # SofiaStorageClient (GPFS via VSC GpfsOperations + CLI)
+    ├── vsc.py          # VscBackend (VSC account page group management)
+    ├── mkhomedir.py    # waldur_make_homedir_vsc entry point
+    ├── mkprojdir.py    # waldur_make_project_vsc entry point
+    └── setprojquota.py # waldur_set_project_quota entry point
+```
 
 ## Development
 
-### Package Structure
-
-```
-src/waldur-vub-storage-plugin/
-├── gpfs/                    # Main Python package
-│   ├── __init__.py
-│   ├── backend.py           # waldur-site-agent backend implementation
-│   └── client.py            # Wrapper for GPFS CLI commands
-├── tests/
-├── pyproject.toml
-└── README.md
-```
-
-### Verify Installation
-
 ```bash
-uv run python -c "from gpfs.backend import VubGpfsBackend; print('Import successful')"
+# from the repository root
+uv sync --all-packages
+
+# verify the import
+uv run python -c "from waldur_site_agent_sofia_storage.backend import SofiaStorageBackend; print('Import OK')"
 ```
 
-### Run Tests
-
-```bash
-cd src/waldur-vub-storage-plugin
-uv run pytest
-```
+There is currently no test suite for this plugin.
