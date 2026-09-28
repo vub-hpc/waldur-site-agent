@@ -11,6 +11,18 @@ dependencies = [
     "vsc-filesystems",
 ]
 
+[tool.pytest.ini_options]
+# Makes `pytest` work from inside this directory without the package being
+# installed (e.g. without uv): the plugin directory is put on sys.path and
+# this directory becomes the pytest rootdir (so no repo-root addopts apply).
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.1.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

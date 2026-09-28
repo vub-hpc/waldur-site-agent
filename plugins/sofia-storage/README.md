@@ -118,12 +118,22 @@ the only way a fileset's quota reaches zero. Consequences:
 
 ## Installation
 
-The plugin is a member of the `waldur-site-agent` uv workspace:
+The plugin is a member of the `waldur-site-agent`:
 
-```bash
-# from the repository root
-uv sync --all-packages
-```
+
+* with `pip`
+
+  ```bash
+  # from the repository root
+  pip install .
+  ```
+
+* with `uv`
+
+  ```bash
+  # from the repository root
+  uv sync --all-packages
+  ```
 
 ## Configuration
 
@@ -236,6 +246,12 @@ The agent must run on a host that:
 plugins/sofia-storage/
 ├── pyproject.toml
 ├── README.md
+├── tests/
+│   ├── conftest.py
+│   ├── test_sofia_backend.py
+│   ├── test_sofia_client.py
+│   ├── test_sofia_scripts.py
+│   └── test_sofia_vsc.py
 └── waldur_site_agent_sofia_storage/
     ├── __init__.py
     ├── backend.py      # SofiaStorageBackend (BaseBackend implementation)
@@ -246,14 +262,25 @@ plugins/sofia-storage/
     └── setprojquota.py # waldur_set_project_quota entry point
 ```
 
-## Development
+### Running the tests
+
+The test suite is pure unit tests — GPFS, the VSC account page and all
+subprocess invocations are mocked — so it runs on any developer machine
+without cluster access.
 
 ```bash
-# from the repository root
-uv sync --all-packages
-
-# verify the import
-uv run python -c "from waldur_site_agent_sofia_storage.backend import SofiaStorageBackend; print('Import OK')"
+# from inside the plugin directory (workspace convention for plugin tests)
+cd plugins/sofia-storage
+pytest
 ```
 
-There is currently no test suite for this plugin.
+The plugin's `pyproject.toml` configures pytest (`pythonpath = ["."]`,
+`testpaths = ["tests"]`), so a plain `pytest` works in any environment
+where `pytest` and the plugin's dependencies are installed — the plugin
+package itself does not need to be installed separately. In a uv workspace
+environment the equivalent `uv run pytest` works the same way.
+
+The suite covers the backend lifecycle (create/terminate/membership/limits/
+usage), the VSC account page integration, the GPFS client layer (including
+`mmlsquota` output parsing) and the standalone scripts. CI runs it as part
+of the `Run plugin tests` job.
