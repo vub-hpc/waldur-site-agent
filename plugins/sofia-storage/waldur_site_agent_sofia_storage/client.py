@@ -159,29 +159,65 @@ class SofiaStorageClient(BaseClient):
 
         return resource_id
 
+    def _parse_mmlsquota_entry(self, output: str, entry_type: str) -> tuple:
+        """Parse machine-readable mmlsquota (-Y) output.
+
+        Returns (block_usage, block_quota) in bytes. Returns (0, 0) when
+        the output carries no data entry (no quota/usage recorded); raises
+        BackendError when a data entry is present but malformed, so a
+        format surprise is never silently read as a valid (wrong) value.
+
+        Entry format (colon-separated):
+        mmlsquota:<type>:version:version:reserved:reserved:filesystemName:
+        quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:
+        blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:
+        remarks:fid:filesetname:
+        """
+        # execute_command merges stderr, so warning lines may interleave;
+        # only a line of the expected entry type is a parse candidate.
+        data_lines = [
+            line for line in output.splitlines()
+            if line.strip() and "HEADER" not in line
+        ]
+        if not data_lines:
+            # no quota/usage recorded
+            return (0, 0)
+
+        entry = None
+        for line in data_lines:
+            fields = line.split(":")
+            if len(fields) >= 2 and fields[1] == entry_type:
+                entry = line
+                break
+        if entry is None:
+            raise BackendError(
+                f"Unexpected mmlsquota output (no {entry_type} entry found): "
+                f"{data_lines[0]!r}"
+            )
+
+        fields = entry.split(":")
+        if len(fields) < 12:
+            raise BackendError(
+                f"Unexpected mmlsquota output (expected at least 12 colon-separated "
+                f"fields in the {entry_type} entry): {entry!r}"
+            )
+        try:
+            # convert from KB to bytes
+            block_usage = self._kb_to_bytes(fields[10])
+            block_quota = self._kb_to_bytes(fields[11])
+        except ValueError:
+            raise BackendError(
+                f"Non-numeric block usage/quota in mmlsquota output: {entry!r}"
+            )
+        return block_usage, block_quota
+
     def get_fileset_quota(self, fileset_name: str, silent: bool = False) -> tuple:
         """Get quota and usage for a specific fileset."""
         command = ["sudo", "/usr/lpp/mmfs/bin/mmlsquota", "-Y", "-j", fileset_name, self.filesystem]
         if not silent:
             logger.info(f"Executing: {' '.join(command)}")
         output = self.execute_command(command, silent=silent)
-
-        try:
-            fs_quota_entry = output.splitlines()[1]
-        except IndexError:
-            # fileset has no quota/usage
-            return (0, 0)
-
-        # mmlsquota:fileset:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:
-        #  blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:
-        #  filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:
-        #  remarks:fid:filesetname:
-        fs_quota = fs_quota_entry.split(":")
-        # convert from KB to bytes
-        block_usage = self._kb_to_bytes(fs_quota[10])
-        block_limit = self._kb_to_bytes(fs_quota[11])
-
-        return block_usage, block_limit
+        return self._parse_mmlsquota_entry(output, "fileset")
 
     def get_resource_user_limits(self, resource_id: str) -> dict[str, dict[str, int]]:
         """Get per-user limits for a resource.
@@ -244,23 +280,7 @@ class SofiaStorageClient(BaseClient):
         if not silent:
             logger.info(f"Executing: {' '.join(command)}")
         output = self.execute_command(command, silent=silent)
-
-        try:
-            user_quota_entry = output.splitlines()[1]
-        except IndexError:
-            # user has no quota/usage in this fileset
-            return (0, 0)
-
-        # mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:
-        #  blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:
-        #  filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:
-        #  remarks:fid:filesetname:
-        user_quota = user_quota_entry.split(":")
-        # convert from KB to bytes
-        block_usage = self._kb_to_bytes(user_quota[10])
-        block_limit = self._kb_to_bytes(user_quota[11])
-
-        return block_usage, block_limit
+        return self._parse_mmlsquota_entry(output, "user")
 
     def collect_project_quotas(self, project: str) -> list:
         """Return fileset and user quotas"""
