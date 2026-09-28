@@ -84,11 +84,10 @@ class VscBackend:
         try:
             self.client.autogroup[self.autogroup['vsc_id']].source[source_group].add.post()
         except HTTPError as err:
-            if err.code == 404:
-                err.reason = "group does not exist"
+            reason = "group does not exist" if err.code == 404 else err.reason
             raise BackendError(
                 f"Failed to add VSC group {source_group} to autogroup {self.autogroup['vsc_id']}"
-                f" due to HTTP error: {err.reason} ({err.code})"
+                f" due to HTTP error: {reason} ({err.code})"
             )
 
         return True
