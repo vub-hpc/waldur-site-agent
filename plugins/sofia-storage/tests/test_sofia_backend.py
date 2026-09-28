@@ -364,6 +364,16 @@ class UsageReportTest(unittest.TestCase):
         self.assertEqual(self.backend._get_usage_report(["bad-res"]), {})
 
 
+class VersionTest(unittest.TestCase):
+    def test_version_is_non_empty(self):
+        # derived from the installed distribution (pyproject.toml is the
+        # single source of truth), or "0.0.0" without an installation
+        from waldur_site_agent_sofia_storage import __version__
+
+        self.assertIsInstance(__version__, str)
+        self.assertTrue(__version__)
+
+
 class MiscTest(unittest.TestCase):
     def test_ping_ok(self):
         client = MagicMock()
