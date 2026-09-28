@@ -1,5 +1,6 @@
 """Sofia Storage backend for Waldur Site Agent."""
 
+import os
 from typing import Optional
 
 from waldur_api_client.models.resource import Resource as WaldurResource
@@ -249,14 +250,12 @@ class SofiaStorageBackend(BaseBackend):
             logger.error("Cannot post-create storage resource without Waldur user context")
             return
 
-        # Home directories of project members
+        # Home directories of project members (best effort: missing home
+        # dirs are created by process_existing_users on the next sync)
         project_members = [user.username for user in user_context['team']]
         project_mods = self._get_project_moderators(user_context)
         for user in project_members + project_mods:
-            try:
-                self.client.sudo_waldur_make_homedir_vsc(user)
-            except Exception as err:
-                raise BackendError(f"Failed to make home directory for user {user}: {err}")
+            self._make_homedir(user)
 
     def delete_resource(
         self,
@@ -278,8 +277,32 @@ class SofiaStorageBackend(BaseBackend):
         except Exception as err:
             logger.error(f"Failed to disable storage quota for {resource_backend_id}: {err}")
 
+    def _make_homedir(self, username: str) -> None:
+        """Create the home dir of a user; failures are logged, not raised.
+
+        process_existing_users retries missing home dirs on every
+        membership sync, so a failure here (e.g. the uid not yet known to
+        the VSC directory service) does not lose the home dir permanently.
+        """
+        try:
+            self.client.sudo_waldur_make_homedir_vsc(username)
+        except Exception as err:
+            logger.error("Failed to make home directory for user %s: %s", username, err)
+
+    def process_existing_users(self, existing_users: set[str]) -> None:
+        """Ensure every existing user has a home dir.
+
+        Covers users added after the resource was created and any home
+        dir whose creation failed earlier; runs on every membership sync.
+        """
+        for username in existing_users:
+            if os.path.isdir(os.path.join(self.home_path, username)):
+                continue
+            logger.info("Creating missing home directory for user %s", username)
+            self._make_homedir(username)
+
     def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
-        """Add user to VSC group of the resource"""
+        """Add user to the VSC group of the resource and create their home dir"""
         del kwargs
 
         if self.vsc_client is None:
@@ -288,7 +311,10 @@ class SofiaStorageBackend(BaseBackend):
             )
 
         project_slug = waldur_resource.project_slug
-        return self.vsc_client.add_user_to_project(project_slug, username)
+        added = self.vsc_client.add_user_to_project(project_slug, username)
+        if added:
+            self._make_homedir(username)
+        return added
 
     def remove_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
         """Remove user from VSC group of the resource.

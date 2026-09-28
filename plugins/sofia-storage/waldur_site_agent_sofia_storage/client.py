@@ -186,20 +186,51 @@ class SofiaStorageClient(BaseClient):
     def get_resource_user_limits(self, resource_id: str) -> dict[str, dict[str, int]]:
         """Get per-user limits for a resource.
 
+        Only users with an actual per-user quota (block limit > 0) are
+        reported: a user without one is bounded by the fileset quota only,
+        and reporting the fileset limit would make the core believe a
+        per-user limit is set (and try to unset it on every sync).
+
         Args:
             resource_id: Backend identifier for the resource.
 
         Returns:
             Nested dict mapping username to component limits.
-            Example: ``{"user1": {"cpu": 30000, "mem": 30720}}``.
+            Example: ``{"user1": {"storage": 50.0}}``.
         """
         resource_user_limits = {}
         project_users = self.list_resource_users(resource_id, silent=True)
         for user in project_users:
-            user_usage, user_limit = self.get_user_quota_in_fileset(resource_id, user, silent=True)
-            user_entry = { user: {"storage": float(user_limit) / self.unit_factor}}
-            resource_user_limits.update(user_entry)
+            _, user_limit = self.get_user_quota_in_fileset(resource_id, user, silent=True)
+            if user_limit > 0:
+                resource_user_limits[user] = {"storage": float(user_limit) / self.unit_factor}
         return resource_user_limits
+
+    def set_resource_user_limits(self, resource_id: str, username: str, limits_dict: dict[str, int]) -> str:
+        """Set the per-user storage quota of a user in a fileset.
+
+        The per-user quota is applied in addition to the fileset quota,
+        which always bounds the user as well.
+
+        Args:
+            resource_id: Backend identifier for the resource (fileset name).
+            username: The user the quota applies to.
+            limits_dict: Component-to-value mapping in Waldur units (the
+                base backend passes the core values through unconverted).
+                An empty mapping (or a missing 'storage' entry) clears the
+                per-user quota (0 = unlimited within the fileset).
+
+        Returns:
+            A confirmation string with the applied quota in bytes.
+        """
+        fileset_path = os.path.join(self.storage_path, resource_id)
+        storage_limit = limits_dict.get("storage")
+        if storage_limit is None:
+            block_limit = 0
+        else:
+            block_limit = int(float(storage_limit) * self.unit_factor)
+        self.operator.set_user_quota(block_limit, username, obj=fileset_path)
+        return f"Per-user storage quota of {username} in fileset {resource_id} set to {block_limit} bytes"
 
     def get_user_quota_in_fileset(self, fileset_name: str, username: str, silent: bool = False) -> tuple:
         """

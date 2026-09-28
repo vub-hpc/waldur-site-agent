@@ -69,8 +69,11 @@ any backend action is taken.
 
 **Add/remove user** (`membership_sync` mode): the user is added to or
 removed from the project's VSC group — access to the fileset follows group
-membership. The applied storage quota is also synced to Waldur as resource
-backend metadata (`storage_limit`, in the offering unit).
+membership. A newly added user gets their home directory (mode `0700`)
+created immediately; home dirs of existing users that are missing (e.g.
+users added before the home dir could be created) are created on every
+membership sync. The applied storage quota is also synced to Waldur as
+resource backend metadata (`storage_limit`, in the offering unit).
 
 **Usage** (`report` mode): the fileset total and each member's usage are
 read with `mmlsquota` and reported for the `storage` component:
@@ -183,6 +186,11 @@ in `backend_components`:
   must carry a positive `storage` limit, and zero-quota resources are
   not allowed (creation and limit updates without a positive limit are
   rejected).
+- **Per-user limits** — a per-user `storage` limit set in Waldur is
+  applied as a per-user GPFS quota on the fileset, in addition to the
+  fileset quota which always bounds the user as well. Removing the
+  per-user limit in Waldur clears the per-user quota (the user is then
+  bounded by the fileset quota only).
 
 ## Standalone Scripts
 
