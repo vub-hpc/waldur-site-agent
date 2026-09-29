@@ -861,7 +861,6 @@ class SlurmClient(SlurmClientInterface):
             args.append(f"DefaultQOS={default_qos}")
         args.append("Share=parent")
         return self._execute_command(args)
->>>>>>> main
 
     # ===== PERIODIC LIMITS EXTENSION =====
 
