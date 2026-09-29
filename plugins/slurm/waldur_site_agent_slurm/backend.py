@@ -31,6 +31,7 @@ from waldur_site_agent_slurm.schemas import ExecutionMode
 # account.
 _VALID_DEFAULT_ACCOUNT_POLICIES = frozenset({"common", "individual", "none"})
 
+SACCTMGR_NOEFFECT_ERROR = "Request didn't affect anything"
 
 def _get_ldap_client(ldap_settings: dict):  # type: ignore[no-untyped-def]  # noqa: ANN202
     """Lazily import and instantiate the LDAP client if configured.
@@ -777,6 +778,24 @@ class SlurmBackend(backends.BaseBackend):
             return False
 
         if not self.client.get_association(username, resource_backend_id):
+            # 1. create association with default account
+            default_account = self.backend_settings.get("default_account", "root")
+            default_account_partition = self.backend_settings.get("default_account_partition", "")
+            logger.info("Creating association between %s and %s", username, default_account)
+            try:
+                self.client.create_association_with_partition(
+                    username,
+                    default_account,
+                    default_account_partition,
+                    default_account,
+                )
+            except BackendError as err:
+                err_mgs = str(err)
+                # move on if default association already exists
+                if not err_mgs.startswith(SACCTMGR_NOEFFECT_ERROR):
+                    logger.exception("Unable to create association with default account on backend: %s", err)
+                    return False
+            # 2. create association with resource account
             logger.info("Creating association between %s and %s", username, resource_backend_id)
             try:
                 policy = self._default_account_policy
@@ -815,20 +834,17 @@ class SlurmBackend(backends.BaseBackend):
                         username,
                         resource_backend_id,
                         self.offering_partitions,
-                        default_account,
                     )
                 elif self._default_partition:
                     self.client.create_association_with_partition(
                         username,
                         resource_backend_id,
                         self._default_partition,
-                        default_account,
                     )
                 else:
                     self.client.create_association(
                         username,
                         resource_backend_id,
-                        default_account,
                     )
                 logger.info("Created association between %s and %s", username, resource_backend_id)
             except BackendError as err:
