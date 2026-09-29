@@ -68,7 +68,7 @@ class SofiaStorageClient(BaseClient):
             # group still not active
             return []
 
-        command = ["sudo", "getent", "group", project_group]
+        command = ["getent", "group", project_group]
         if not silent:
             logger.info(f"Executing: {' '.join(command)}")
         output = self.execute_command(command, silent=silent)

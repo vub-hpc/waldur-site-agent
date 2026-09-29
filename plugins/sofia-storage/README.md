@@ -215,14 +215,14 @@ offering whose `backend_type` is `sofia_storage`:
 | `waldur_make_project_vsc` | `<project_dir> <owner_uid> <owner_gid>` | Create the fileset and set ownership (mode `0770`) |
 | `waldur_set_project_quota` | `<project_dir> <block_limit>` | Set the fileset block quota (inode soft limit 1M) |
 
-## GPFS Commands Used
+## External Commands Used
 
 - Fileset creation, ownership and quota setting: VSC `GpfsOperations`
   interface (`vsc.filesystem.gpfs`)
 - `sudo /usr/lpp/mmfs/bin/mmlsquota` — `-Y -j <fileset>` for the fileset
   quota/usage, `-Y -u <user> <fs>:<fileset>` for a user's quota/usage in a
   fileset
-- `sudo getent group <group>` — members of the project's VSC group, read
+- `getent group <group>` — members of the project's VSC group, read
   from the local name service instead of querying the VSC account page
 
 ## Requirements
@@ -236,7 +236,6 @@ The agent must run on a host that:
   - `sudo /usr/local/bin/waldur_make_project_vsc *`
   - `sudo /usr/local/bin/waldur_set_project_quota *`
   - `sudo /usr/lpp/mmfs/bin/mmlsquota *`
-  - `sudo getent group *`
 - can resolve VSC identities (UID lookups for home directories)
 - can reach the VSC account page (`https://account.vscentrum.be/django/api`)
 
