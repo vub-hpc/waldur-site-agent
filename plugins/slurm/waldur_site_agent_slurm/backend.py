@@ -781,7 +781,7 @@ class SlurmBackend(backends.BaseBackend):
             # 1. create association with default account
             default_account = self.backend_settings.get("default_account", "root")
             default_account_partition = self.backend_settings.get("default_account_partition", "")
-            logger.info("Creating association between %s and %s", username, default_account)
+            logger.info("Creating association between %s and %s (partition=%s)", username, default_account, default_account_partition)
             try:
                 self.client.create_association_with_partition(
                     username,
