@@ -17,12 +17,14 @@ Add an optional execution mode to the SLURM plugin that talks to
 defaults to the existing CLI behavior, and requires no changes to the
 core agent or to the `SlurmBackend` business logic.
 
-The scope is limited to functionality the REST API provides
-**directly**: account, association, user, QOS and limit management,
-plus job listing/cancellation and health checks. Usage reporting has no
-direct REST equivalent (no `sreport`-style aggregation endpoint) and
-therefore **stays on the `sacct` CLI in both modes** — REST mode is a
-hybrid: REST for management operations, CLI for accounting reports.
+REST mode covers account, association, user, QOS and limit management,
+job listing/cancellation, health checks and usage reporting (aggregated
+client-side from `/slurmdb/vX/jobs` records). The only operations that
+still shell out to `sacctmgr` are RawUsage resets of an account or a
+QOS, which have no REST endpoint.
+
+Usage reporting was originally kept on `sacct` (see section 4 for the
+original reasoning); it has since moved to REST.
 
 The implementation is a second client class, `SlurmRestClient`, behind a
 shared client interface — a **hand-rolled httpx client pinned to a
@@ -30,12 +32,10 @@ configurable API version**, not a generated OpenAPI client.
 
 ## Motivation
 
-- The agent currently requires SLURM client binaries and a working
-  munge/SACK auth domain on the host it runs on. A REST mode moves the
-  management path (accounts, associations, limits, QOS) to HTTP + JWT.
-  Note: because usage reporting stays on `sacct` for now, REST mode
-  does not yet remove the need for CLI binaries on hosts that collect
-  usage — fully remote deployment is future work.
+- The CLI mode requires SLURM client binaries and a working
+  munge/SACK auth domain on the agent host. REST mode moves management
+  and usage reporting to HTTP + JWT; only RawUsage resets still need
+  `sacctmgr` on the host.
 - Structured JSON responses remove a whole class of output-parsing
   fragility (`--parsable2` pipe-splitting, locale/format drift between
   SLURM releases).
@@ -58,8 +58,10 @@ All SLURM interaction funnels through
   backend only calls public client methods and never touches command
   syntax itself.
 - Non-SLURM operations (homedir creation, project directories, Lustre
-  quotas, `id -u` checks) live on the **backend**, not the client, and
-  are out of scope — they behave identically in both modes.
+  quotas) live on the **backend**, not the client, and behave
+  identically in both modes. The user-existence check is a client
+  method: `id -u` in CLI mode, `GET /slurmdb/vX/user/{name}` in REST
+  mode.
 
 The client's public method surface (~35 methods) is therefore the
 natural swap point. Its weakness today: only the 13 `BaseClient`
@@ -88,7 +90,8 @@ methods (QOS, fairshare, parents, partitions, job control) do not.
     `{"set": bool, "infinite": bool, "number": N}`; clearing a limit
     means sending `set: false`, not `null`.
   - No pagination — job queries must always be bounded with
-    `start_time` / `end_time` and use `skip_steps=true`.
+    `start_time` / `end_time` (the usage queries are bounded by the
+    reporting month).
 
 ### Why not a generated OpenAPI client
 
@@ -124,9 +127,9 @@ layer (`httpx`) with endpoint mappings and payload builders.
 
 - **httpx**, not requests: unix-socket support via
   `httpx.HTTPTransport(uds=...)` and a single client type for both UDS
-  and TCP. Declared as an optional extra
-  (`waldur-site-agent-slurm[rest]`) so CLI-only deployments gain no
-  dependency.
+  and TCP. `httpx` is a regular dependency of the plugin (the
+  `[rest]` extra still exists and only raises the minimum to
+  `httpx>=0.27`).
 - API version is a config string (`api_version`, default `v0.0.43`);
   URLs are templated (`/slurmdb/{ver}/associations`). Payload
   field-name differences between versions are isolated in a small
@@ -141,45 +144,68 @@ layer (`httpx`) with endpoint mappings and payload builders.
   tolerant of no-op updates).
 - The `executed_commands` log mirrors the CLI client's for debugging
   and tests; in REST mode it also surfaces the commands run by the
-  delegated CLI client (usage reporting, RawUsage reset).
+  delegated CLI client (RawUsage resets).
 - Responses are converted into the same typed structures
   (`ClientResource`, `Association`, `SlurmReportLine`) so parsers and
   backend logic are reused, not duplicated.
 
 ### 3. Operation mapping
 
-| CLI today | REST equivalent |
-|---|---|
-| `sacctmgr add/show/remove account` | `POST/GET/DELETE /slurmdb/vX/accounts`, `/account/{name}` |
-| `sacctmgr add user ... account=...` | `POST /slurmdb/vX/users_association` / `/associations` |
-| `sacctmgr modify account set GrpTRESMins=...` | `POST /slurmdb/vX/associations` with `max.tres.group.minutes` |
-| `sacctmgr modify ... set qos/fairshare/parent` | association payload fields `qos`, `shares_raw`, `parent_account` |
-| `sacctmgr show association ...` (limits, users, QOS) | `GET /slurmdb/vX/associations?account=...&cluster=...` |
-| QOS create/delete/modify | `GET/POST/DELETE /slurmdb/vX/qos` |
-| `scancel -A account [-u user]` | `GET /slurm/vX/jobs` filtered, then `DELETE /slurm/vX/job/{id}` per job |
-| `sacctmgr --version` (health check) | `GET /slurm/vX/ping` and `GET /slurmdb/vX/ping` |
-| `sacct --starttime --endtime --accounts ...` | **Stays on CLI** — no direct REST equivalent (see Usage reporting) |
-| `sacctmgr modify account set RawUsage=0` | **Stays on CLI** — no REST equivalent (see Limitations) |
+- `sacctmgr add/show/remove account` — `POST/GET/DELETE /slurmdb/vX/accounts`, `/account/{name}`
+- `sacctmgr add user ... account=...` — `POST /slurmdb/vX/users_association` / `/associations`
+- `sacctmgr modify account set GrpTRESMins=...` — `POST /slurmdb/vX/associations` with
+  `max.tres.group.minutes`
+- `sacctmgr modify ... set qos/fairshare/parent` — association payload fields `qos`, `shares_raw`,
+  `parent_account`
+- `sacctmgr modify account set qos+=...` — the account row's `qos` list, then the same QoS added to
+  every user association of the account whose own list lacks it (REST has no `+=` delta)
+- QOS `GrpTRESMins` — `limits.max.tres.minutes.total` (associations use `max.tres.group.minutes`)
+- `sacctmgr show association ...` (limits, users, QOS) — `GET
+  /slurmdb/vX/associations?account=...&cluster=...`
+- QOS create/delete/modify — `GET/POST/DELETE /slurmdb/vX/qos`
+- `scancel -A account [-u user]` — `GET /slurm/vX/jobs` filtered, then `DELETE /slurm/vX/job/{id}`
+  per job
+- `sinfo -V` (version, health check) — `GET /slurm/vX/ping`
+- `sacct --starttime --endtime --accounts ...` (usage) — `GET
+  /slurmdb/vX/jobs?account=...&start_time=...&end_time=...`, aggregated client-side (section 4)
+- `sacctmgr modify account/qos set RawUsage=0` — **Stays on CLI** — no REST equivalent (see
+  Limitations)
 
-### 4. Usage reporting — out of scope, stays on CLI
+### 4. Usage reporting
 
-There is no `sreport` equivalent in the REST API: the only path would
-be fetching raw `/slurmdb/vX/jobs` records and re-implementing the
-aggregation (requested TRES × elapsed minutes per account/user)
-client-side. That is **not** functionality the REST API provides
-directly, and it feeds billing — re-deriving it from job records would
-need a full accounting period of validation against `sacct` before it
-could be trusted.
+**Original decision (kept for context):** there is no `sreport`
+equivalent in the REST API, so usage would have to be re-derived from
+raw `/slurmdb/vX/jobs` records. Because that feeds billing, usage
+reporting was first left on `sacct` in both modes, with `SlurmRestClient`
+delegating it to an internal `SlurmClient`.
 
-Decision: usage reporting (`get_usage_report`,
-`get_historical_usage_report`) is excluded from `SlurmRestClient` and
-keeps using `sacct` in both modes. In `execution_mode: rest`, the
-backend wires the usage-report methods to the existing CLI client
-(composition: `SlurmRestClient` delegates these methods to an internal
-`SlurmClient`), so `SlurmBackend` still sees a single client object.
+**Current implementation:** `get_usage_report` and
+`get_historical_usage_report` query `GET /slurmdb/vX/jobs/` for the
+month window (with `cluster` when `cluster_name` is set; the account and
+cluster are re-checked client-side because older slurmrestd versions
+ignore unknown query parameters) and render each job as the same
+`Account|TRES|Elapsed|User` line the CLI parser consumes, so the
+aggregation downstream is shared with CLI mode:
 
-Moving usage reporting to REST (client-side aggregation from
-`/slurmdb/jobs`) can be revisited later as a separate proposal.
+- **Elapsed** is clipped to the reporting window, as `sacct --truncate`
+  does: a job spanning a month boundary is billed to each month only for
+  its part inside it; a running job counts until the window closes or
+  until now, whichever is earlier.
+- **TRES** come from `tres.requested` (sacct `ReqTRES`), or with
+  `usage_tres_source: allocated` from `tres.allocated` (sacct `AllocTRES`),
+  falling back to `tres.requested` for jobs that never started. Both
+  clients pick through the same function (`parser.pick_usage_tres`).
+- **Truncation and duplicates** are slurmdbd's: the query carries
+  `skip_steps=true` (sacct's `--allocations`), and setting any job-condition
+  flag stops slurmrestd from defaulting to `show_duplicates` and
+  `disable_truncate_usage_time`. slurmdbd then caps the window at now,
+  takes suspended time off and keeps one record per job ID, as for
+  `sacct --truncate` without `--duplicates`. The window is sent as epochs,
+  read in the agent host's local time as sacct reads the CLI's naive
+  window (the offering timezone only picks the dates), so slurmdbd and
+  the client use the same edges.
+  The client repeats the clip and the duplicate removal for a server that
+  ignores the flag.
 
 ### 5. Authentication
 
@@ -200,6 +226,8 @@ The client sends both `X-SLURM-USER-TOKEN` and `X-SLURM-USER-NAME`.
 
 Backward compatible — absence of the new keys means CLI mode:
 
+<!-- docs-check: skip -->
+
 ```yaml
 offerings:
   - name: "My SLURM Cluster"
@@ -216,19 +244,33 @@ offerings:
         verify_ssl: true           # for TLS-terminating reverse proxies
 ```
 
-`SlurmBackendSettingsSchema` has an `execution_mode` literal and a
-nested `rest_api` model (required iff `execution_mode: rest`).
-`diagnostics()` reports the mode, endpoint, API version, and ping
-results for both namespaces.
+`SlurmBackendSettingsSchema` has an `execution_mode` enum and a nested
+`rest_api` model (required iff `execution_mode: rest`, together with
+`cluster_name`). `diagnostics()` logs the execution mode and the SLURM
+version from `GET /slurm/vX/ping`; `ping()` lists accounts. The full key
+reference is in the [SLURM plugin README](../plugins/slurm/README.md#rest-api-execution-mode).
 
 ### 7. Limitations (documented, not worked around silently)
 
-- Usage reporting stays on the `sacct` CLI (see section 4), so REST
-  mode still requires SLURM client binaries and cluster auth on hosts
-  that run usage collection.
-- `reset_raw_usage` (`sacctmgr modify account set RawUsage=0`) has no
-  REST endpoint and likewise stays on the CLI client.
-- Beyond these two explicitly delegated operations, there is no
+- An association `POST` is the association's complete TRES state:
+  slurmrestd removes every TRES list the request leaves out
+  (`associations.c` `_diff_tres`). Every association write therefore
+  reads the row first and resends the lists it does not change. This
+  is a read-modify-write, so concurrent writers to the same
+  association can still lose an update; the agent serializes them per
+  account.
+
+- RawUsage resets (`reset_raw_usage`, `reset_qos_raw_usage`) have no
+  REST endpoint and stay on the CLI client. Without `sacctmgr` on the
+  host they fail with an explicit `BackendError` instead of a
+  "command not found".
+- Usage figures are aggregated client-side from job records but follow
+  the same rules as CLI mode, so both modes report the same usage
+  (section 4; `tests/test_usage_parity.py` holds them to it). One
+  case still depends on the server: if a slurmrestd ignored
+  `skip_steps`, suspended time of a job clipped at the window edge
+  would not be subtracted.
+- Beyond the delegated resets, there is no
   automatic REST→CLI fallback on errors: silent divergence between
   modes is worse than a loud failure. The mode is an explicit
   per-offering choice.
@@ -258,8 +300,8 @@ results for both namespaces.
 
 Tracked separately, not part of this design:
 
-- Usage reporting via REST (client-side aggregation from
-  `/slurmdb/jobs`), enabling fully CLI-free deployments.
+- A REST path (or a documented alternative) for RawUsage resets, so a
+  REST-mode host needs no SLURM binaries at all.
 - Self-minted HS256 / JWKS-based authentication.
 
 ## References

@@ -272,7 +272,7 @@ dependencies = [
     { name = "jmespath" },
     { name = "python-dateutil" },
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/86/2d/6f6101f567a69c3b2ebe3f1f81bfd56eda9d5f6f466d0d919293499ab050/botocore-1.42.46.tar.gz", hash = "sha256:fc290b33aba6e271f627c4f46b8bcebfa1a94e19157d396732da417404158c01", size = 14948751, upload-time = "2026-02-10T20:37:58.663Z" }
 wheels = [
@@ -281,11 +281,11 @@ wheels = [
 
 [[package]]
 name = "certifi"
-version = "2026.1.4"
+version = "2026.10.19"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e0/2d/a891ca51311197f6ad14a7ef42e2399f36cf2f9bd44752b3dc4eab60fdc5/certifi-2026.1.4.tar.gz", hash = "sha256:ac726dd470482006e014ad384921ed6438c457018f4b3d204aea4281258b2120", size = 154268, upload-time = "2026-01-04T02:42:41.825Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/bd/1436c50cc46699de0230fbaacc1d1de7bfec413176099949e9d5112e88f2/certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae", size = 137598, upload-time = "2026-10-20T02:24:16.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/ad/3cc14f097111b4de0040c83a525973216457bbeeb63739ef1ed275c1c021/certifi-2026.1.4-py3-none-any.whl", hash = "sha256:9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c", size = 152900, upload-time = "2026-01-04T02:42:40.15Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b", size = 136464, upload-time = "2026-10-20T02:24:15.072Z" },
 ]
 
 [[package]]
@@ -878,7 +878,7 @@ dependencies = [
     { name = "certifi" },
     { name = "ecs-logging" },
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "wrapt" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/71/59/f05957f1bdcffd6da6fd404107cb9903a3c0ead2b665c8a602ab3a6e3abb/elastic_apm-6.25.0.tar.gz", hash = "sha256:7845f53a5ccc65a21c3e44a18f69cf821e0c326ebb8a6e8ac3257bdaf58aa40d", size = 170436, upload-time = "2025-12-23T09:09:03.754Z" }
@@ -980,6 +980,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
+]
+
+[package.optional-dependencies]
+socks = [
+    { name = "socksio" },
 ]
 
 [[package]]
@@ -1096,7 +1101,7 @@ dependencies = [
     { name = "requests-oauthlib" },
     { name = "six" },
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "websocket-client" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7e/bd/ffcd3104155b467347cd9b3a64eb24182e459579845196b3a200569c8912/kubernetes-31.0.0.tar.gz", hash = "sha256:28945de906c8c259c1ebe62703b56a03b714049372196f854105afe4e6d014c0", size = 916096, upload-time = "2024-09-20T03:16:08.089Z" }
@@ -1520,11 +1525,11 @@ wheels = [
 
 [[package]]
 name = "oauthlib"
-version = "3.3.1"
+version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/0b/5f/19930f824ffeb0ad4372da4812c50edbd1434f678c90c2733e1188edfc63/oauthlib-3.3.1.tar.gz", hash = "sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9", size = 185918, upload-time = "2025-06-19T22:48:08.269Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/d8/a1bcc8ba112a627f8ffbdc212a78ce18d3ac07e91a5ca65d27918eee25a1/oauthlib-4.0.0.tar.gz", hash = "sha256:efb274799819440f95b4ab3b818869f1ce9ae26c5beacba0201d1a1b76b54f86", size = 187232, upload-time = "2026-09-28T06:01:18.77Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/be/9c/92789c596b8df838baa98fa71844d84283302f7604ed565dafe5a6b5041a/oauthlib-3.3.1-py3-none-any.whl", hash = "sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1", size = 160065, upload-time = "2025-06-19T22:48:06.508Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/f4/78229a1066068ca14fc60fb26cf7381cabe4382261392b90e5f9552722d4/oauthlib-4.0.0-py3-none-any.whl", hash = "sha256:624c28c13a0a59cabf9747dfa52af63be3e512a7f2714df16e91b5b3a145e6cd", size = 159715, upload-time = "2026-09-28T06:01:17.008Z" },
 ]
 
 [[package]]
@@ -1758,15 +1763,15 @@ wheels = [
 
 [[package]]
 name = "pyjwt"
-version = "2.13.0"
+version = "2.15.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions", version = "4.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "typing-extensions", version = "4.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/ea/5194e52748b0da83d71e082d75496eaec6e58f419f5e184786ded517e6a9/pyjwt-2.15.1.tar.gz", hash = "sha256:4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8", size = 121252, upload-time = "2026-09-28T18:40:42.598Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
+    { url = "https://files.pythonhosted.org/packages/50/ca/44de4e75f8aadc457f0634be3b542815078ded46dca30efb960edeecad6e/pyjwt-2.15.1-py3-none-any.whl", hash = "sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193", size = 33860, upload-time = "2026-09-28T18:40:41.429Z" },
 ]
 
 [package.optional-dependencies]
@@ -1891,6 +1896,15 @@ wheels = [
 ]
 
 [[package]]
+name = "python-socks"
+version = "2.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/ad/5bbfab3d3a266963cca0c09e23a725bbf5f0535d21c8bd1d5272e4430771/python_socks-2.8.2.tar.gz", hash = "sha256:ffc493951854fa3fc0551e0434a09a7b9f9047f9ad666dce42cb94a52e8a34b6", size = 39656, upload-time = "2026-06-23T05:22:01.994Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3d/18/23b981b1cf58c1e7b7e36fa1392daf12878b6a3c26c5e4248601647a6d09/python_socks-2.8.2-py3-none-any.whl", hash = "sha256:7cf785d0631e0659384a773b3c402bc22cccdc23894ba1d65f8524748ace1193", size = 55501, upload-time = "2026-06-23T05:22:00.658Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1958,7 +1972,7 @@ dependencies = [
     { name = "certifi" },
     { name = "charset-normalizer" },
     { name = "idna" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5f/a4/98b9c7c6428a668bf7e42ebb7c79d576a1c3c1e3ae2d47e674b468388871/requests-2.33.1.tar.gz", hash = "sha256:18817f8c57c6263968bc123d237e3b8b08ac046f5456bd1e307ee8f4250d3517", size = 134120, upload-time = "2026-03-30T16:09:15.531Z" }
 wheels = [
@@ -2061,7 +2075,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "urllib3", version = "2.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "urllib3", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c9/9d/d61d64819ecb0481647229c3ee8ddc00887552acc23745fd65d0d4d066f3/sentry_sdk-2.8.0.tar.gz", hash = "sha256:aa4314f877d9cd9add5a0c9ba18e3f27f99f7de835ce36bd150e48a41c7c646f", size = 273663, upload-time = "2024-07-08T08:11:38.246Z" }
 wheels = [
@@ -2079,7 +2093,7 @@ wheels = [
 
 [[package]]
 name = "slurm-emulator"
-version = "0.9.7"
+version = "0.9.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click", version = "8.1.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -2094,9 +2108,18 @@ dependencies = [
     { name = "uvicorn", version = "0.39.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "uvicorn", version = "0.40.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/11/fa56275b7d9e32615ea4725d7b2b2c4b862997daf71a0beb8821dd8a1e0f/slurm_emulator-0.9.7.tar.gz", hash = "sha256:29f17e71209602dde47f10b812512c99dd932bef235acdd9ff6bcd4c3aea7e5e", size = 208004, upload-time = "2026-09-14T18:32:45.05Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/94/6efa421ffd287e93537167846d87c0a7b36dab64e43a5449226213b6ee3e/slurm_emulator-0.9.10.tar.gz", hash = "sha256:b64fb7be1dc64ec6579827a8f60bfbf923051771151e6dabf56ef535a9f14d82", size = 307847, upload-time = "2026-10-20T19:19:02.357Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/79/e2/2138be3ebd0f1d0a7c509b9f3b10e90ba3e6b5c87da40fcbca3a69dfa9a6/slurm_emulator-0.9.7-py3-none-any.whl", hash = "sha256:67969a85611411add25cd3ed62cdab776f7c4f779400785139fdfb31e3300e75", size = 225663, upload-time = "2026-09-14T18:32:43.412Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/4c/bfb94780578b6268a121e7f9874e510442657fe99efe8c027f2539c00eb7/slurm_emulator-0.9.10-py3-none-any.whl", hash = "sha256:cded4d86ea81865d15b9640f7ff9dd88717230efb4d04ea34cb302034d084f9e", size = 333780, upload-time = "2026-10-20T19:19:00.634Z" },
+]
+
+[[package]]
+name = "socksio"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/5c/48a7d9495be3d1c651198fd99dbb6ce190e2274d0f28b9051307bdec6b85/socksio-1.0.0.tar.gz", hash = "sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac", size = 19055, upload-time = "2020-04-17T15:50:34.664Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/c3/6eeb6034408dac0fa653d126c9204ade96b819c936e136c5e8a6897eee9c/socksio-1.0.0-py3-none-any.whl", hash = "sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3", size = 12763, upload-time = "2020-04-17T15:50:31.878Z" },
 ]
 
 [[package]]
@@ -2280,14 +2303,14 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.7.0"
+version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.10'",
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
 
 [[package]]
@@ -2326,27 +2349,28 @@ wheels = [
 
 [[package]]
 name = "waldur-api-client"
-version = "8.1.3rc10.dev259"
+version = "8.1.3rc23.dev20261010084617"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "httpx" },
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/88/fb5088fb29981d2630fe1ee170a840e5fefd07b3bb54c61b1de5670995d1/waldur_api_client-8.1.3rc10.dev259.tar.gz", hash = "sha256:40245f169ea01d20aecd035f982eee510f8cb6a5264d234c1dc5be0c0ab8eb42", size = 2530217, upload-time = "2026-09-07T16:06:56.483Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/58/0db4bcb08abc3b8ccbeef69a0350b83a44f136b563e5cceed3b94dc0b414/waldur_api_client-8.1.3rc23.dev20261010084617.tar.gz", hash = "sha256:7a286dab0dd1287c169846bc69a7f77a1067051c1c325326a74f99916ae5e6b9", size = 2764862, upload-time = "2026-10-10T09:43:13.976Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/c9/3d5e5782740bc4aaee49d8750aef886fb607bfa10d52cd47b89ae9aa8d2f/waldur_api_client-8.1.3rc10.dev259-py3-none-any.whl", hash = "sha256:3d36aeb96e3250031ef7ad0f4550f6b06a3d7c389fece5a9e12854b26043e6f4", size = 7674848, upload-time = "2026-09-07T16:06:59.693Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/68/dc60855000524e2eec413c4af744d67e3bf31969ae2c0fe91704be778053/waldur_api_client-8.1.3rc23.dev20261010084617-py3-none-any.whl", hash = "sha256:bd2aed869d6a813ae6d8f31b084ebcf2d45334f2f390f050c96c5e48a819be41", size = 8149894, upload-time = "2026-10-10T09:43:17.029Z" },
 ]
 
 [[package]]
 name = "waldur-site-agent"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "." }
 dependencies = [
     { name = "elastic-apm" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "importlib-metadata", marker = "python_full_version < '3.10'" },
     { name = "pydantic" },
+    { name = "python-socks" },
     { name = "pyyaml" },
     { name = "sentry-sdk" },
     { name = "stomp-py" },
@@ -2373,14 +2397,15 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "elastic-apm", specifier = ">=6.0.0,<7" },
-    { name = "httpx", specifier = ">=0.28.1,<0.29" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.28.1,<0.29" },
     { name = "importlib-metadata", marker = "python_full_version == '3.9.*'", specifier = ">=8.7.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "python-socks", specifier = ">=2.4,<3" },
     { name = "pyyaml", specifier = "==6.0.1" },
     { name = "sentry-sdk", specifier = "==2.8.0" },
     { name = "stomp-py", specifier = ">=8.2.0,<9" },
     { name = "structlog", specifier = ">=25.4.0" },
-    { name = "waldur-api-client", specifier = "==8.1.3rc10.dev259" },
+    { name = "waldur-api-client", specifier = "==8.1.3rc23.dev20261010084617" },
 ]
 
 [package.metadata.requires-dev]
@@ -2400,7 +2425,7 @@ dev = [
 
 [[package]]
 name = "waldur-site-agent-azure"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/azure" }
 dependencies = [
     { name = "azure-identity" },
@@ -2421,7 +2446,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-basic-username-management"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/basic_username_management" }
 dependencies = [
     { name = "waldur-site-agent" },
@@ -2432,7 +2457,7 @@ requires-dist = [{ name = "waldur-site-agent", editable = "." }]
 
 [[package]]
 name = "waldur-site-agent-ceph-s3"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/ceph-s3" }
 dependencies = [
     { name = "boto3" },
@@ -2449,7 +2474,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-cscs-dwdi"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/cscs-dwdi" }
 dependencies = [
     { name = "httpx" },
@@ -2464,7 +2489,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-digitalocean"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/digitalocean" }
 dependencies = [
     { name = "python-digitalocean" },
@@ -2479,7 +2504,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-envoy-ai-gateway"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/envoy-ai-gateway" }
 dependencies = [
     { name = "httpx" },
@@ -2496,7 +2521,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-harbor"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/harbor" }
 dependencies = [
     { name = "httpx" },
@@ -2511,7 +2536,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-k8s-ut-namespace"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/k8s-ut-namespace" }
 dependencies = [
     { name = "kubernetes" },
@@ -2528,7 +2553,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-keycloak-client"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/keycloak-client" }
 dependencies = [
     { name = "python-keycloak" },
@@ -2543,7 +2568,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-ldap"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/ldap" }
 dependencies = [
     { name = "jinja2" },
@@ -2560,7 +2585,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-ldap-client"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/ldap-client" }
 dependencies = [
     { name = "ldap3" },
@@ -2575,7 +2600,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-ldap-roles"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/ldap-roles" }
 dependencies = [
     { name = "waldur-site-agent" },
@@ -2590,7 +2615,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-litellm"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/litellm" }
 dependencies = [
     { name = "httpx" },
@@ -2605,7 +2630,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-moab"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/moab" }
 dependencies = [
     { name = "waldur-site-agent" },
@@ -2616,7 +2641,7 @@ requires-dist = [{ name = "waldur-site-agent", editable = "." }]
 
 [[package]]
 name = "waldur-site-agent-mup"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/mup" }
 dependencies = [
     { name = "httpx" },
@@ -2633,7 +2658,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-nextcloud"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/nextcloud" }
 dependencies = [
     { name = "httpx" },
@@ -2648,7 +2673,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-okd"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/okd" }
 dependencies = [
     { name = "httpx" },
@@ -2665,7 +2690,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-opennebula"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/opennebula" }
 dependencies = [
     { name = "pyone" },
@@ -2684,7 +2709,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-rancher"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/rancher" }
 dependencies = [
     { name = "httpx" },
@@ -2701,7 +2726,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-rancher-kc-crd"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/rancher-kc-crd" }
 dependencies = [
     { name = "kubernetes" },
@@ -2716,7 +2741,7 @@ requires-dist = [
 
 [[package]]
 name = "waldur-site-agent-slurm"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/slurm" }
 dependencies = [
     { name = "httpx" },
@@ -2751,12 +2776,12 @@ provides-extras = ["ldap", "rest"]
 dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", specifier = ">=7.1.0" },
-    { name = "slurm-emulator", specifier = ">=0.9.7" },
+    { name = "slurm-emulator", specifier = ">=0.9.10" },
 ]
 
 [[package]]
 name = "waldur-site-agent-waldur"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 source = { editable = "plugins/waldur" }
 dependencies = [
     { name = "waldur-site-agent" },

@@ -87,6 +87,7 @@ def test_rows_are_keyed_by_alias_not_by_hash(mock_client_cls: mock.Mock) -> None
     # alias, so attributing by hash would split a slot's month in two.
     assert rows == [
         {
+            "date": "2026-08-01",
             "key_alias": "res-1",
             "input_tokens": 10,
             "output_tokens": 20,
@@ -148,6 +149,57 @@ def test_a_key_used_on_several_days_yields_a_row_per_day(mock_client_cls: mock.M
 
 
 @mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")
+def test_each_person_row_carries_the_day_it_was_recorded_on(mock_client_cls: mock.Mock) -> None:
+    # The day is what lets the reporting backend bill a row to whoever owned the address
+    # then, rather than to whoever owns it when the report runs.
+    instance = mock_client_cls.return_value
+    by_key = {
+        "entities": {
+            "ada@example.com": {"api_key_breakdown": {"hash-s": _entry("shared", 10, 20, 0.5)}}
+        }
+    }
+    no_key_split = {
+        "entities": {
+            "ada@example.com": {"metrics": {"prompt_tokens": 5, "completion_tokens": 6}}
+        }
+    }
+    instance.get.return_value = _ok(
+        {
+            "results": [
+                _day("2026-08-01", {}, by_key),
+                _day("2026-08-02", {}, no_key_split),
+            ],
+            "metadata": {"total_pages": 1, "has_more": False},
+        }
+    )
+
+    rows = _client().get_user_usage_rows("2026-08-01", "2026-08-31")
+
+    assert [(row["date"], row["user_id"], row["input_tokens"]) for row in rows] == [
+        ("2026-08-01", "ada@example.com", 10),
+        ("2026-08-02", "ada@example.com", 5),
+    ]
+
+
+@mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")
+def test_a_timestamped_day_is_cut_to_the_date(mock_client_cls: mock.Mock) -> None:
+    # Ownership periods compare plain dates; a time tail would put a period's last day
+    # outside it.
+    instance = mock_client_cls.return_value
+    entities = {"entities": {"ada@example.com": {"metrics": {"prompt_tokens": 1}}}}
+    instance.get.return_value = _ok(
+        {
+            "results": [_day("2026-08-01T00:00:00", {}, entities)],
+            "metadata": {"total_pages": 1, "has_more": False},
+        }
+    )
+
+    rows = _client().get_user_usage_rows("2026-08-01", "2026-08-31")
+
+    assert rows[0]["date"] == "2026-08-01"
+
+
+@mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")
 def test_a_key_with_no_alias_is_skipped(mock_client_cls: mock.Mock) -> None:
     instance = mock_client_cls.return_value
     instance.get.return_value = _ok(
@@ -168,6 +220,75 @@ def test_a_key_with_no_alias_is_skipped(mock_client_cls: mock.Mock) -> None:
     # resource to bill.
     rows = _client().get_usage_rows("2026-08-01", "2026-08-31")
     assert [row["key_alias"] for row in rows] == ["res-1"]
+
+
+@mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")
+def test_user_rows_carry_the_key_each_was_served_on(mock_client_cls: mock.Mock) -> None:
+    instance = mock_client_cls.return_value
+    instance.get.return_value = _ok(
+        {
+            "results": [
+                _day(
+                    "2026-08-01",
+                    {"h-1": _entry("res-1", 10, 20, 0.5), "h-s": _entry("shared", 1, 2, 0.1)},
+                    {
+                        "entities": {
+                            "ada@example.com": {
+                                "metrics": {"prompt_tokens": 11, "completion_tokens": 22},
+                                "api_key_breakdown": {
+                                    "h-1": _entry("res-1", 10, 20, 0.5),
+                                    "h-s": _entry("shared", 1, 2, 0.1),
+                                },
+                            }
+                        }
+                    },
+                )
+            ],
+            "metadata": {"total_pages": 1, "has_more": False},
+        }
+    )
+
+    rows = _client().get_user_usage_rows("2026-08-01", "2026-08-31")
+
+    assert [(row["key_alias"], row["input_tokens"]) for row in rows] == [
+        ("res-1", 10),
+        ("shared", 1),
+    ]
+    assert all("day_key_aliases" not in row for row in rows)
+
+
+@mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")
+def test_a_user_row_with_no_key_split_carries_the_days_keys(mock_client_cls: mock.Mock) -> None:
+    # An older proxy gives the entity total only. The day's keys go with it, so the
+    # caller can tell whether it may hold usage already billed by alias.
+    instance = mock_client_cls.return_value
+    instance.get.return_value = _ok(
+        {
+            "results": [
+                _day(
+                    "2026-08-01",
+                    {
+                        "h-1": _entry("res-1", 10, 20, 0.5),
+                        "h-x": {"metadata": {}, "metrics": {}},
+                    },
+                    {
+                        "entities": {
+                            "ada@example.com": {
+                                "metrics": {"prompt_tokens": 11, "completion_tokens": 22}
+                            }
+                        }
+                    },
+                )
+            ],
+            "metadata": {"total_pages": 1, "has_more": False},
+        }
+    )
+
+    (row,) = _client().get_user_usage_rows("2026-08-01", "2026-08-31")
+
+    assert row["key_alias"] is None
+    assert row["input_tokens"] == 11
+    assert row["day_key_aliases"] == ["res-1", None]
 
 
 @mock.patch("waldur_site_agent_litellm.usage_client.httpx.Client")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional
@@ -25,6 +26,7 @@ from waldur_site_agent.backend.exceptions import (
     BackendError,
     BackendNotReadyError,
     DuplicateResourceError,
+    UserNotProvisionedError,
 )
 
 UNKNOWN_BACKEND_TYPE = "unknown"
@@ -49,6 +51,40 @@ def _pull_strict() -> bool:
     return bool(getattr(_PULL_STATE, "strict", False))
 
 
+class AddedUsers(set):
+    """Users added to a resource, plus those the backend failed to add.
+
+    A plain set to every caller that only wants the added names; membership
+    sync also reads ``failed`` ({username: cause}) to log the users it could
+    not add. Set operations and copies return a plain ``set`` and
+    drop ``failed``, so read it from the object the backend returned.
+    """
+
+    def __init__(
+        self, added: Iterable[str] = (), failed: Optional[Mapping[str, str]] = None
+    ) -> None:
+        """Hold the added usernames and the cause for each failed one."""
+        super().__init__(added)
+        self.failed: dict[str, str] = dict(sorted((failed or {}).items()))
+
+
+class RemovedUsers(list):
+    """Users no longer associated with a resource, plus those that failed to go.
+
+    A plain list to every caller that only wants the removed names (see
+    ``remove_users_from_resource``); ``failed`` maps each removal the backend
+    attempted and could not complete to its cause. Slicing, concatenation and
+    copies return a plain ``list`` and drop ``failed``.
+    """
+
+    def __init__(
+        self, removed: Iterable[str] = (), failed: Optional[Mapping[str, str]] = None
+    ) -> None:
+        """Hold the removed usernames and the cause for each failed one."""
+        super().__init__(removed)
+        self.failed: dict[str, str] = dict(sorted((failed or {}).items()))
+
+
 class PendingOrderDecision(Enum):
     """Decision for an order in PENDING_PROVIDER state."""
 
@@ -57,8 +93,29 @@ class PendingOrderDecision(Enum):
     PENDING = "pending"
 
 
+class BackendRole(str, Enum):
+    """A role an offering can assign to a backend, named after its config key without ``_backend``.
+
+    Username management is not listed: those backends come from their own entry point
+    group, so the group already says which role they fill.
+    """
+
+    ORDER_PROCESSING = "order_processing"
+    MEMBERSHIP_SYNC = "membership_sync"
+    REPORTING = "reporting"
+
+
 class BaseBackend(ABC):
     """Backend class with implemented generic methods and other abstract methods."""
+
+    # Roles an offering may assign to this backend. Published in the plugin catalogue
+    # so Waldur can offer only fitting backends per role; a backend that only reports
+    # usage narrows it to REPORTING.
+    supported_roles: ClassVar[tuple[BackendRole, ...]] = (
+        BackendRole.ORDER_PROCESSING,
+        BackendRole.MEMBERSHIP_SYNC,
+        BackendRole.REPORTING,
+    )
 
     # Capability flag: Set to True for backends where usage can decrease
     # (e.g., storage backends reporting current state, not accumulated usage)
@@ -84,9 +141,42 @@ class BaseBackend(ABC):
     # such as the residue of a rotation whose reply was lost; None means unknown, so
     # nothing is pruned — reading it as empty would delete every live credential.
     #
-    # There is no revoke: the key count is fixed at provisioning and a rotation
-    # replaces a value in place.
+    # Those two methods are the whole contract unless the backend also sets
+    # supports_resource_api_key_lifecycle.
     supports_resource_api_keys: bool = False
+
+    # Whether the backend governs its keys one by one, beyond generation and
+    # rotation: mint a single key on demand, pause and resume one key, delete one
+    # key, and apply one key's limits and model allowlist. Each is a command from
+    # Waldur that the agent carries out on the backend first and acknowledges to
+    # Waldur second, as with rotation. Only meaningful with
+    # supports_resource_api_keys, and gated separately because not every backend
+    # with keys can honour it: ceph-s3's access key rotates with its secret and
+    # pausing it is a no-op, so it keeps the two-method contract.
+    #
+    # A per-key pause is a separate verb from pause_resource, not a variant of it:
+    # a key can be paused while its resource is serving, and restoring the resource
+    # must leave that key paused. See the *_resource_key methods below.
+    supports_resource_api_key_lifecycle: bool = False
+
+    # Whether this (reporting) backend can attribute usage to individual API keys,
+    # through get_resource_key_usage_report. Waldur holds a key's limits and pauses it
+    # once its reported usage reaches one, so this is what makes per-key limits work
+    # on a backend that has no budget primitive of its own.
+    supports_resource_api_key_usage: bool = False
+
+    # Whether this (reporting) backend can report usage per UTC day, through
+    # get_daily_usage_report_for_period and, with supports_resource_api_key_usage,
+    # get_resource_key_daily_usage_report. A Waldur with per-day usage needs it for day
+    # and week spending limits; to a Waldur without it the agent sends month totals.
+    supports_daily_usage: bool = False
+
+    # Whether the backend takes a key's limits per period. Its mint_resource_key,
+    # resume_resource_key, update_resource_key and rotate_resource_key are then also
+    # handed ``spending_limits``: ``{component: {period: amount}}`` from a Waldur with
+    # per-period key limits, or None from one without, beside the month-only
+    # ``limits`` every Waldur sends.
+    supports_spending_limit_periods: bool = False
 
     # Capability flag: Set to True for backends that depend on a remote API during
     # order processing. The processor calls run_preflight() once per offering
@@ -112,6 +202,13 @@ class BaseBackend(ABC):
     # source project from Waldur and passes it to sync_resource_project so the
     # plugin never calls Waldur itself.
     requires_source_project: bool = False
+
+    # Capability flag: Set to True for backends that need to know who each of a
+    # resource's API keys is assigned to (a chat surface that follows the person's
+    # key, for instance). When enabled, and the offering manages its keys one by one,
+    # the processor joins Waldur's key listing to the offering users and passes the
+    # result to sync_resource_key_assignees, so the plugin never calls Waldur itself.
+    requires_resource_key_assignees: bool = False
 
     # Capability flag: Set to True for backends where every resource federated from a
     # given source project collapses onto one shared backend project (e.g. Waldur-to-
@@ -152,6 +249,16 @@ class BaseBackend(ABC):
         # a pointed warning when partition enforcement cannot take effect because
         # the offering is not configured to produce usernames.
         self.partition_enforcement_enabled: bool = False
+
+    def remote_waldur_base_urls(self) -> list[str]:
+        """Base URLs of any remote Waldur this backend calls with the Waldur API client.
+
+        The processor treats a 4xx from its own Waldur as a bookkeeping problem
+        rather than a backend failure. A Waldur-to-Waldur backend returns its
+        target here so the target's errors stay backend errors even when it
+        shares the agent's origin (served under a path, or on loopback).
+        """
+        return []
 
     @abstractmethod
     def ping(self, raise_exception: bool = False) -> bool:
@@ -274,6 +381,23 @@ class BaseBackend(ABC):
         """
         return {}
 
+    def get_daily_usage_report_for_period(
+        self,
+        resource_backend_ids: list[str],
+        year: int,
+        month: int,
+    ) -> dict[str, dict[str, dict[str, float]]]:
+        """Collect a month's usage per UTC day (``supports_daily_usage``).
+
+        Returns ``{resource_backend_id: {"YYYY-MM-DD": {component: usage}}}`` in
+        Waldur units. A day with no usage may be left out; the agent reports it as
+        zero. Summed over the days, the figures equal the month's
+        ``TOTAL_ACCOUNT_USAGE``. Only components Waldur bills by usage are reported
+        per day; the others keep their month total.
+        """
+        del resource_backend_ids, year, month
+        return {}
+
     @abstractmethod
     def downscale_resource(self, resource_backend_id: str) -> bool:
         """Downscale the resource, restricting its capabilities.
@@ -344,6 +468,14 @@ class BaseBackend(ABC):
         No-op guidance:
             Return an empty dict ``{}`` if no metadata is available.
         """
+
+    def expects_target_event_subscriptions(self) -> bool:
+        """Whether this backend opens event subscriptions on a target system.
+
+        The event-mode watchdog retries a missing target subscription only when
+        this is True. Override together with ``setup_target_event_subscriptions``.
+        """
+        return False
 
     def setup_target_event_subscriptions(
         self,
@@ -962,6 +1094,10 @@ class BaseBackend(ABC):
         ):
             raise DuplicateResourceError(resource_backend_id)
 
+        # Prerequisites named after the backend ID run only now that the ID is
+        # known to be accepted, so a rejected attempt leaves nothing behind.
+        self._on_backend_resource_created(resource_backend_id, waldur_resource)
+
         # Setup limits
         waldur_limits = self._setup_resource_limits(resource_backend_id, waldur_resource)
         backend_resource_info = structures.BackendResourceInfo(
@@ -998,6 +1134,27 @@ class BaseBackend(ABC):
         self.client.set_resource_limits(resource_backend_id, resource_backend_limits)
         return waldur_limits
 
+    def _on_backend_resource_created(
+        self, resource_backend_id: str, waldur_resource: WaldurResource
+    ) -> None:
+        """Perform actions once the backend resource has been created.
+
+        Called by ``create_resource_with_id`` right after the backend accepted
+        ``resource_backend_id`` and before limits are set. Use this for
+        anything later operations address by the backend ID (e.g., SLURM's LDAP
+        project group, project directory and per-account QoS).
+
+        Do not do this in ``_pre_create_resource``: the uniqueness retry calls
+        it for every candidate ID, including the ones the backend then rejects,
+        so it would leave a prerequisite behind for each rejected name.
+
+        Args:
+            resource_backend_id: The backend ID the resource was created with;
+                the value persisted as the resource's ``backend_id``.
+            waldur_resource: Resource data from Waldur marketplace.
+        """
+        del resource_backend_id, waldur_resource
+
     def post_create_resource(
         self,
         resource: structures.BackendResourceInfo,
@@ -1024,12 +1181,21 @@ class BaseBackend(ABC):
     def add_users_to_resource(
         self, waldur_resource: WaldurResource, user_ids: set[str], **kwargs: dict
     ) -> set[str]:
-        """Add specified users to the resource on the backend."""
+        """Add specified users to the resource on the backend.
+
+        Every user is tried, so one failure does not block the rest. Returns an
+        ``AddedUsers`` set of the users added; its ``failed`` lists the users
+        whose ``add_user`` raised, with the cause; membership sync logs them at
+        ERROR and retries them on the next pass, leaving the resource state
+        alone. A user who
+        raises ``UserNotProvisionedError`` (not in the IdP yet) is skipped and
+        retried on the next pass.
+        """
         del kwargs
         resource_backend_id = waldur_resource.backend_id
         if len(user_ids) < 1:
             logger.info("No new users to add")
-            return set()
+            return AddedUsers()
 
         logger.info(
             "Adding %s users to resource %s on backend: %s",
@@ -1038,12 +1204,23 @@ class BaseBackend(ABC):
             " ,".join(user_ids),
         )
         added_users = set()
+        failed_users: dict[str, str] = {}
         for username in user_ids:
             try:
                 succeeded = self.add_user(waldur_resource, username)
                 if succeeded:
                     added_users.add(username)
+            except UserNotProvisionedError as e:
+                # Not in the identity provider yet (no first sign-in): retried on
+                # the next pass, not a backend failure.
+                logger.warning(
+                    "User %s is not provisioned for resource %s yet, will retry: %s",
+                    username,
+                    resource_backend_id,
+                    e,
+                )
             except BackendError as e:
+                failed_users[username] = str(e)
                 logger.exception(
                     "Unable to add user %s to resource %s, details: %s",
                     username,
@@ -1051,10 +1228,17 @@ class BaseBackend(ABC):
                     e,
                 )
 
-        return added_users
+        return AddedUsers(added_users, failed_users)
 
     def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
-        """Add association between user and backend resource if it doesn't exists."""
+        """Add association between user and backend resource if it doesn't exists.
+
+        Contract for overrides, as for ``remove_user``: return True when the
+        association exists afterwards and False when there was nothing to add
+        (a blank username). An association that could not be created must
+        **raise** BackendError -- False is read as a benign skip, so a failure
+        folded into it would report the user as handled.
+        """
         del kwargs  # Used by subclass overrides (e.g. WaldurBackend for role_name)
         resource_backend_id = waldur_resource.backend_id
         if not resource_backend_id.strip():
@@ -1076,8 +1260,11 @@ class BaseBackend(ABC):
                 )
                 logger.info("Created association between %s and %s", username, resource_backend_id)
             except BackendError as err:
-                logger.exception("Unable to create association on backend: %s", err)
-                return False
+                msg = (
+                    f"Unable to create association between {username} and "
+                    f"{resource_backend_id}: {err}"
+                )
+                raise BackendError(msg) from err
         else:
             logger.info("Association already exists, skipping creation")
         return True
@@ -1090,15 +1277,17 @@ class BaseBackend(ABC):
         Returns the usernames that are no longer associated with the resource:
         those removed here, plus any a backend knows were never associated at
         all. A name left out is one the caller must treat as still associated --
-        core releases a departed account only against this list, so the per-user
-        failure swallowed below (deliberately: one bad user must not stop the
-        rest) keeps that account until a later cycle removes it for real.
+        core releases a departed account only against this list, so a per-user
+        failure (caught below so one bad user does not stop the rest) keeps that
+        account until a later cycle removes it for real. The result is a
+        ``RemovedUsers`` list whose ``failed`` maps those users to the cause,
+        which membership sync logs at ERROR without changing the resource state.
         """
         del kwargs
         resource_backend_id = waldur_resource.backend_id
         if len(usernames) < 1:
             logger.info("No users to remove")
-            return []
+            return RemovedUsers()
 
         logger.info(
             "Removing %s users from resource %s on backend: %s",
@@ -1107,19 +1296,21 @@ class BaseBackend(ABC):
             " ,".join(usernames),
         )
         removed_users = []
+        failed_users: dict[str, str] = {}
         for username in usernames:
             try:
                 succeeded = self.remove_user(waldur_resource, username)
                 if succeeded:
                     removed_users.append(username)
             except BackendError as e:
+                failed_users[username] = str(e)
                 logger.exception(
                     "Unable to remove user %s from resource %s, details: %s",
                     username,
                     resource_backend_id,
                     e,
                 )
-        return removed_users
+        return RemovedUsers(removed_users, failed_users)
 
     def _pre_delete_user_actions(self, resource_backend_id: str, username: str) -> None:
         """Perform actions before removing the user from the resource.
@@ -1215,6 +1406,23 @@ class BaseBackend(ABC):
         """
         del waldur_resource, source_project
 
+    def sync_resource_key_assignees(
+        self, waldur_resource: WaldurResource, assignments: dict[str, Optional[str]]
+    ) -> None:
+        """Apply who each of the resource's API keys is assigned to.
+
+        Called when ``requires_resource_key_assignees`` is True and the offering
+        manages its keys one by one: on every membership sync of the resource (except
+        one restricted for its members, whose members are all removed), and after a
+        key is created. ``assignments`` maps the client_id of every key the resource
+        holds (deleted keys, and requested ones with no client_id yet, left out) to its
+        assignee's offering username -- the name the membership sync adds them under --
+        or to None when the key is assigned to nobody, or to someone with no actionable
+        offering user or no username yet. The map is complete: a client_id missing
+        from it is not a key of the resource. Default: no-op.
+        """
+        del waldur_resource, assignments
+
     def process_existing_users(self, existing_users: set[str]) -> None:
         """Process existing users on the backend.
 
@@ -1291,6 +1499,155 @@ class BaseBackend(ABC):
         implementing it is the exception, not the contract.
         """
         del resource_backend_id, keep
+
+    # --- per-key API key lifecycle (supports_resource_api_key_lifecycle) --------
+    #
+    # Not abstract: only backends that set the flag implement them, and the agent
+    # never calls them otherwise. Each one applies the change to the backend and
+    # returns; the caller reports the result to Waldur. Each must be safe to run
+    # again after it already succeeded, because the reconciliation sweep replays a
+    # command whose acknowledgement never reached Waldur.
+    #
+    # ``limits`` maps a component type to a limit in Waldur units (0 = no limit).
+    # ``allowed_models`` lists the models the key may call: ``["*"]`` (ALL_MODELS on
+    # its own) is every model, an empty list is none, anything else is those names.
+    # None, which a Waldur older than ``["*"]`` still sends, also means every model.
+    # It is the key's effective list: Waldur narrows the key's own list by its
+    # resource's model selection before sending it, so ``["*"]`` reaches a backend
+    # only when neither restricts anything.
+    # A backend that cannot honour a setting it is given must raise rather than
+    # accept it silently: the key would otherwise be reported as restricted when it
+    # is not. The empty list is such a setting: Waldur shows that key as having no
+    # models.
+    #
+    # ``rotate_resource_key`` of a backend with the lifecycle also takes ``limits``
+    # and ``allowed_models`` as keywords: the key's own settings, for a rotation that
+    # has to mint a key the backend lost. ``limits`` is a dict whenever Waldur's
+    # settings are known; both None means they could not be read. It takes
+    # ``resource_limits`` too, as ``mint_resource_key`` does, when Waldur's resource
+    # was read.
+
+    def mint_resource_key(
+        self,
+        resource_backend_id: str,
+        reserved_client_ids: list[str],
+        limits: Optional[dict] = None,
+        allowed_models: Optional[list[str]] = None,
+        resource_limits: Optional[dict] = None,
+    ) -> dict:
+        """Create one more key for the resource and apply it, leaving the others alone.
+
+        Returns ``{"client_id": ..., "api_key": ...}``. ``reserved_client_ids`` are
+        identifiers Waldur already holds for the resource, deleted keys included; the
+        new key must not take one of them, since Waldur attributes usage by client_id
+        and refuses a reused one. A key minted onto a paused resource must not serve
+        until the resource is restored.
+
+        ``resource_limits`` are the resource's limits as Waldur holds them (None when
+        not read), for a backend that caps a key by its resource's limits as well as
+        its own; a backend that does not can ignore them.
+        """
+        del resource_backend_id, reserved_client_ids, limits, allowed_models, resource_limits
+        msg = f"{type(self).__name__} does not mint individual API keys"
+        raise NotImplementedError(msg)
+
+    def pause_resource_key(self, client_id: str, resource_backend_id: str) -> None:
+        """Stop one key from serving; the resource and its other keys are untouched.
+
+        The key keeps its value, and stays paused when the resource is paused and
+        restored around it.
+        """
+        del client_id, resource_backend_id
+        msg = f"{type(self).__name__} does not pause individual API keys"
+        raise NotImplementedError(msg)
+
+    def resume_resource_key(
+        self,
+        client_id: str,
+        resource_backend_id: str,
+        limits: Optional[dict] = None,
+        allowed_models: Optional[list[str]] = None,
+    ) -> None:
+        """Lift a key's own pause and apply the settings it carries.
+
+        The settings travel with the resume because they may have been edited while
+        the key was paused. A key of a paused resource stays held until the resource
+        is restored.
+        """
+        del client_id, resource_backend_id, limits, allowed_models
+        msg = f"{type(self).__name__} does not resume individual API keys"
+        raise NotImplementedError(msg)
+
+    def delete_resource_key(self, client_id: str, resource_backend_id: str) -> None:
+        """Revoke one key for good. Deleting a key that is already gone succeeds."""
+        del client_id, resource_backend_id
+        msg = f"{type(self).__name__} does not delete individual API keys"
+        raise NotImplementedError(msg)
+
+    def update_resource_key(
+        self,
+        client_id: str,
+        resource_backend_id: str,
+        limits: Optional[dict] = None,
+        allowed_models: Optional[list[str]] = None,
+    ) -> None:
+        """Apply a key's limits and model allowlist."""
+        del client_id, resource_backend_id, limits, allowed_models
+        msg = f"{type(self).__name__} does not configure individual API keys"
+        raise NotImplementedError(msg)
+
+    def get_resource_key_usage_report(
+        self, resource_backend_ids: list[str]
+    ) -> dict[str, Optional[dict[str, dict[str, float]]]]:
+        """Return the current month's usage per API key (supports_resource_api_key_usage).
+
+        Maps a resource backend id to ``{client_id: {component: usage}}``, in Waldur
+        units, with the same components ``_get_usage_report`` reports for the resource.
+        Summed over the keys, the figures equal the resource total that report holds.
+        A resource whose usage the backend cannot attribute to keys maps to None,
+        which is different from ``{}`` — no usage at all this month.
+        """
+        del resource_backend_ids
+        return {}
+
+    def get_resource_key_daily_usage_report(
+        self, resource_backend_ids: list[str]
+    ) -> dict[str, Optional[dict[str, dict[str, dict[str, float]]]]]:
+        """The current month's usage per API key and UTC day (``supports_daily_usage``).
+
+        Maps a resource backend id to ``{client_id: {"YYYY-MM-DD": {component: usage}}}``,
+        days with no usage left out or not, as for ``get_daily_usage_report_for_period``.
+        Summed over the days, a key's figures are those of
+        ``get_resource_key_usage_report``, and None means the same: the resource's usage
+        cannot be attributed to its keys.
+        """
+        del resource_backend_ids
+        return {}
+
+    def get_resource_key_usage_report_for_period(
+        self, resource_backend_ids: list[str], year: int, month: int
+    ) -> dict[str, Optional[dict[str, dict[str, float]]]]:
+        """A closed month's usage per API key, as ``get_resource_key_usage_report`` gives it.
+
+        The agent sends each key's figures for the previous month once more in the
+        first days of a new one, so that the usage after its last report before
+        midnight still counts for a total limit. A resource left out of the result --
+        everything, by default -- is not reported for that month; ``{}`` is a resource
+        with no usage in it, and None one whose usage cannot be attributed to keys.
+        """
+        del resource_backend_ids, year, month
+        return {}
+
+    def get_resource_key_daily_usage_report_for_period(
+        self, resource_backend_ids: list[str], year: int, month: int
+    ) -> dict[str, Optional[dict[str, dict[str, dict[str, float]]]]]:
+        """A closed month's usage per API key and UTC day (``supports_daily_usage``).
+
+        As ``get_resource_key_daily_usage_report``, for the month given; a resource left
+        out is not reported for it, as for ``get_resource_key_usage_report_for_period``.
+        """
+        del resource_backend_ids, year, month
+        return {}
 
     def _get_resource_backend_id(self, resource_slug: str, prefix: str = "") -> str:
         prefix = self.backend_settings.get("allocation_prefix", "")
@@ -1517,6 +1874,37 @@ class AbstractUsernameManagementBackend(ABC):
         system before membership synchronization runs. Default: no-op.
         """
         del offering_users
+
+    def reconcile_offering(self, waldur_rest_client: AuthenticatedClient) -> None:
+        """Offering-wide reconcile that does not hang off the offering-user list.
+
+        Core calls this once per periodic cycle (the membership-sync pass, and
+        the periodic reconcile of event_process mode), after
+        ``sync_user_profiles``, whether or not the offering has any offering
+        users -- so state that must also be cleaned up when the last account is
+        gone has a place to be. Default: no-op.
+        """
+        del waldur_rest_client
+
+    def reconciles_project_groups(self) -> bool:
+        """Whether this backend writes the provider's project groups.
+
+        When it does, the event-process mode subscribes the offering to
+        project-group events and calls ``reconcile_project_groups`` on them, so
+        a group Waldur creates or renumbers reaches the directory without
+        waiting for the next periodic cycle. Default: False.
+        """
+        return False
+
+    def reconcile_project_groups(self, waldur_rest_client: AuthenticatedClient) -> None:
+        """Write the provider's project groups, outside the periodic cycle.
+
+        Called on project-group events, at most once per short burst of them,
+        and from the same process that runs the periodic cycle: an
+        implementation must tolerate running concurrently with
+        ``reconcile_offering``. Default: no-op.
+        """
+        del waldur_rest_client
 
     def deactivate_users(self, usernames: set[str]) -> None:
         """Deactivate users no longer in the offering.

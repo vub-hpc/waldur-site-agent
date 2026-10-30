@@ -116,7 +116,11 @@ from waldur_site_agent.backend.backends import (
     UnknownUsernameManagementBackend,
 )
 from waldur_site_agent.backend.exceptions import BackendError
-from waldur_site_agent.common import WALDUR_SITE_AGENT_VERSION, structures
+from waldur_site_agent.common import (
+    WALDUR_SITE_AGENT_VERSION,
+    static_token_prefix,
+    structures,
+)
 from waldur_site_agent.common.log_shipper import LogShipper
 
 # Handle different Python versions
@@ -225,8 +229,9 @@ def get_client(
     agent_header: Optional[str] = None,
     verify_ssl: bool = True,
     proxy: Optional[str] = None,
-    token_prefix: str = "Token",  # noqa: S107
+    token_prefix: Optional[str] = None,
     timeout: float = DEFAULT_CLIENT_TIMEOUT,
+    auth: Optional[httpx.Auth] = None,
 ) -> AuthenticatedClient:
     """Create an authenticated Waldur API client.
 
@@ -236,8 +241,11 @@ def get_client(
         agent_header: Optional User-Agent string for HTTP requests
         verify_ssl: Whether or not to verify SSL certificates
         proxy: Optional proxy URL (e.g., 'socks5://localhost:12345')
-        token_prefix: Authorization header prefix ('Token' for static tokens, 'Bearer' for JWTs)
+        token_prefix: Authorization header prefix ('Token' for API tokens, 'Bearer' for JWTs and
+            personal access tokens); derived from access_token when omitted
         timeout: HTTP timeout in seconds for requests made with this client
+        auth: Optional httpx auth that sets the Authorization header per request,
+            overriding the static one built from access_token
 
     Returns:
         Configured AuthenticatedClient instance ready for API calls
@@ -246,14 +254,16 @@ def get_client(
     url = api_url.rstrip("/").removesuffix("/api")
 
     # Configure httpx args with proxy if specified
-    httpx_args = {}
+    httpx_args: dict[str, object] = {}
     if proxy:
         httpx_args["proxy"] = proxy
+    if auth is not None:
+        httpx_args["auth"] = auth
 
     return AuthenticatedClient(
         base_url=url,
         token=access_token,
-        prefix=token_prefix,
+        prefix=token_prefix if token_prefix is not None else static_token_prefix(access_token),
         timeout=timeout,
         headers=headers,
         verify_ssl=verify_ssl,
@@ -314,7 +324,8 @@ def fetch_oidc_token(
                 return token
 
     # Fetch outside the lock to avoid blocking other offerings during network I/O.
-    with httpx.Client(verify=verify_ssl, proxy=proxy, timeout=timeout) as client:
+    # An empty proxy (the global_proxy default) means none; httpx rejects "".
+    with httpx.Client(verify=verify_ssl, proxy=proxy or None, timeout=timeout) as client:
         response = client.post(
             oidc_token_url,
             data={
@@ -340,6 +351,48 @@ def fetch_oidc_token(
     return token
 
 
+class OfferingAuth(httpx.Auth):
+    """Authorization header for an offering, resolved on every request.
+
+    Static tokens are sent as ``Token <token>``, personal access tokens as
+    ``Bearer <token>``. For OIDC-only offerings the
+    bearer JWT is looked up per request through ``fetch_oidc_token``, so a
+    long-lived client keeps working after the token it started with expires;
+    a cache hit costs only a dictionary lookup.
+    """
+
+    def __init__(
+        self,
+        offering: structures.Offering,
+        proxy: Optional[str] = None,
+        timeout: float = DEFAULT_OIDC_TIMEOUT,
+    ) -> None:
+        """Remember the offering whose credentials authorize requests."""
+        self.offering = offering
+        self.proxy = proxy
+        self.timeout = timeout
+
+    def authorization(self) -> str:
+        """Return the current Authorization header value."""
+        token = self.offering.waldur_api_token
+        if token:
+            return f"{static_token_prefix(token)} {token}"
+        token = fetch_oidc_token(
+            self.offering.oidc_token_url,  # type: ignore[arg-type]
+            self.offering.oidc_client_id,  # type: ignore[arg-type]
+            self.offering.oidc_client_secret,  # type: ignore[arg-type]
+            self.offering.verify_ssl,
+            self.proxy,
+            timeout=self.timeout,
+        )
+        return f"Bearer {token}"
+
+    def auth_flow(self, request: httpx.Request):  # noqa: ANN201
+        """Set the Authorization header on each outgoing request."""
+        request.headers["Authorization"] = self.authorization()
+        yield request
+
+
 def get_client_for_offering(
     offering: structures.Offering,
     agent_header: Optional[str] = None,
@@ -349,23 +402,33 @@ def get_client_for_offering(
     """Create an authenticated Waldur API client from an Offering configuration.
 
     If waldur_api_token is set, uses it directly as a static token (``Token``
-    prefix). Otherwise obtains a JWT from the configured OIDC provider (``Bearer``
-    prefix), reusing a cached token until it nears expiry.
+    prefix, or ``Bearer`` for a personal access token). Otherwise obtains a JWT
+    from the configured OIDC provider (``Bearer`` prefix), reusing a cached token
+    until it nears expiry.
 
     Args:
         offering: Offering configuration containing API URL and auth settings
         agent_header: Optional User-Agent string for HTTP requests
-        proxy: Optional proxy URL (e.g., 'socks5://localhost:12345')
+        proxy: Optional proxy URL (e.g., 'socks5://localhost:12345'). Defaults to
+            the configuration's global_proxy; an empty value means no proxy.
         timeout: HTTP timeout in seconds applied to both the OIDC token request
             and the returned client. Defaults to the long agent timeouts.
 
     Returns:
         Configured AuthenticatedClient instance ready for API calls
     """
+    # httpx rejects proxy="" outright, so an unset proxy must become None.
+    proxy = proxy or offering.global_proxy or None
+    auth: Optional[OfferingAuth] = None
     if offering.waldur_api_token:
         token = offering.waldur_api_token
-        token_prefix = "Token"  # noqa: S105
+        token_prefix = static_token_prefix(token)
     else:
+        # Fetch once up front so a misconfigured provider fails here, then let
+        # OfferingAuth refresh the JWT per request for long-lived clients.
+        auth = OfferingAuth(
+            offering, proxy, DEFAULT_OIDC_TIMEOUT if timeout is None else timeout
+        )
         token = fetch_oidc_token(
             offering.oidc_token_url,  # type: ignore[arg-type]
             offering.oidc_client_id,  # type: ignore[arg-type]
@@ -383,6 +446,7 @@ def get_client_for_offering(
         proxy,
         token_prefix,
         timeout=DEFAULT_CLIENT_TIMEOUT if timeout is None else timeout,
+        auth=auth,
     )
 
 
@@ -702,7 +766,9 @@ def mark_waldur_resources_as_erred(
             marketplace_provider_resources_set_as_erred.sync_detailed(
                 uuid=resource.uuid.hex, client=waldur_rest_client, body=request_body
             )
-        except UnexpectedStatus as e:
+        except (UnexpectedStatus, httpx.TransportError) as e:
+            # One resource that cannot be marked must not stop the others: the
+            # caller is usually walking every resource of the offering.
             logger.exception(
                 "Waldur REST client error while setting resource state to Erred %s: %s",
                 resource.backend_id,
@@ -720,12 +786,8 @@ def load_offering_components() -> None:
     configuration = init_configuration()
     for offering in configuration.waldur_offerings:
         logger.info("Processing %s offering", offering.name)
-        waldur_rest_client = get_client(
-            offering.api_url,
-            offering.api_token,
-            configuration.waldur_user_agent,
-            offering.verify_ssl,
-            configuration.global_proxy,
+        waldur_rest_client = get_client_for_offering(
+            offering, configuration.waldur_user_agent, configuration.global_proxy
         )
 
         load_components_to_waldur(
@@ -960,6 +1022,20 @@ def get_current_user_from_client(waldur_rest_client: AuthenticatedClient) -> Use
     return users_me_retrieve.sync(client=waldur_rest_client)
 
 
+def _describe_waldur_error(err: Exception) -> str:
+    """One line for a failed Waldur call, naming bad credentials as such."""
+    if isinstance(err, UnexpectedStatus):
+        if err.status_code in (401, 403):
+            return (
+                f"authentication failed (HTTP {err.status_code}): check waldur_api_token "
+                "or the OIDC settings, and that the account manages this offering"
+            )
+        return f"HTTP {err.status_code} from {err.url}"
+    if isinstance(err, httpx.TransportError):
+        return f"cannot reach Waldur: {err}"
+    return str(err)
+
+
 def diagnostics() -> int:
     """Perform comprehensive system diagnostics for all offerings.
 
@@ -971,6 +1047,7 @@ def diagnostics() -> int:
         0 if all diagnostics pass, 1 if any issues are detected
     """
     configuration = init_configuration()
+    issues_found = False
     logger.info("-" * 10 + "DIAGNOSTICS START" + "-" * 10)
     logger.info("Provided settings:")
     format_string = "{:<30} = {:<10}"
@@ -1003,7 +1080,6 @@ def diagnostics() -> int:
         offering_uuid = offering.uuid
         offering_name = offering.name
         offering_api_url = offering.api_url
-        offering_api_token = offering.api_token
 
         logger.info(format_string.format("Offering name", offering_name))
         logger.info(format_string.format("Offering UUID", offering_uuid))
@@ -1015,13 +1091,11 @@ def diagnostics() -> int:
             )
         )
 
-        waldur_rest_client = get_client(
-            offering_api_url,
-            offering_api_token,
-            configuration.waldur_user_agent,
-            offering.verify_ssl,
+        waldur_rest_client = get_client_for_offering(
+            offering, configuration.waldur_user_agent, configuration.global_proxy
         )
 
+        offering_data = None
         try:
             current_user = get_current_user_from_client(waldur_rest_client)
             print_current_user(current_user)
@@ -1059,8 +1133,9 @@ def diagnostics() -> int:
                 logger.info(format_string.format(*component))
 
             logger.info("")
-        except UnexpectedStatus as err:
-            logger.error("Unable to fetch offering data, reason: %s", err)
+        except (UnexpectedStatus, httpx.TransportError) as err:
+            logger.error("Unable to fetch offering data: %s", _describe_waldur_error(err))
+            issues_found = True
 
         logger.info("")
         try:
@@ -1083,8 +1158,9 @@ def diagnostics() -> int:
             logger.info(format_string.format(*headers))
             for order in orders:
                 logger.info(format_string.format(order.project_name, order.type_, order.state))
-        except UnexpectedStatus as err:
-            logger.error("Unable to fetch orders, reason: %s", err)
+        except (UnexpectedStatus, httpx.TransportError) as err:
+            logger.error("Unable to fetch orders: %s", _describe_waldur_error(err))
+            issues_found = True
 
         backend, _ = get_backend_for_offering(offering, "order_processing_backend")
 
@@ -1115,7 +1191,7 @@ def diagnostics() -> int:
 
     logger.info("-" * 10 + "DIAGNOSTICS END" + "-" * 10)
 
-    return 0
+    return 1 if issues_found else 0
 
 
 def create_homedirs_for_offering_users() -> None:
@@ -1149,12 +1225,8 @@ def create_homedirs_for_offering_users() -> None:
         # One offering's unreachable backend or API must not cost the remaining
         # offerings their homedirs — this command sweeps all of them in one run.
         try:
-            waldur_rest_client = get_client(
-                offering.api_url,
-                offering.api_token,
-                configuration.waldur_user_agent,
-                offering.verify_ssl,
-                configuration.global_proxy,
+            waldur_rest_client = get_client_for_offering(
+                offering, configuration.waldur_user_agent, configuration.global_proxy
             )
             offering_users = marketplace_offering_users_list.sync_all(
                 client=waldur_rest_client,
@@ -1736,12 +1808,8 @@ def sync_offering_users() -> None:
     for offering in configuration.waldur_offerings:
         logger.info("Processing offering users for %s", offering.name)
 
-        waldur_rest_client = get_client(
-            offering.api_url,
-            offering.api_token,
-            configuration.waldur_user_agent,
-            offering.verify_ssl,
-            configuration.global_proxy,
+        waldur_rest_client = get_client_for_offering(
+            offering, configuration.waldur_user_agent, configuration.global_proxy
         )
         offering_users = marketplace_offering_users_list.sync_all(
             client=waldur_rest_client,
@@ -1799,12 +1867,8 @@ def sync_resource_limits() -> None:
         )
         backend, _ = get_backend_for_offering(offering, "membership_sync_backend")
         logger.info("Using class %s as a backend", backend.__class__.__name__)
-        waldur_rest_client = get_client(
-            offering.api_url,
-            offering.api_token,
-            configuration.waldur_user_agent,
-            offering.verify_ssl,
-            configuration.global_proxy,
+        waldur_rest_client = get_client_for_offering(
+            offering, configuration.waldur_user_agent, configuration.global_proxy
         )
         resources = marketplace_resources_list.sync_all(
             client=waldur_rest_client,
@@ -1858,7 +1922,7 @@ def ensure_log_shipper(
     Subsequent calls with the same agent_identity_uuid are no-ops.
 
     Args:
-        offering: offering configuration (provides api_url and api_token)
+        offering: offering configuration (provides api_url and credentials)
         agent_identity_uuid: UUID of the registered AgentIdentity
         log_shipping_config: global log shipping configuration
     """
@@ -1880,6 +1944,7 @@ def ensure_log_shipper(
         api_url=offering.api_url,
         api_token=offering.api_token,
         agent_identity_uuid=agent_identity_uuid,
+        auth=OfferingAuth(offering),
         ship_interval=ls_cfg.ship_interval_seconds,
     )
     shipper.start()
@@ -2053,8 +2118,12 @@ def rotate_resource_api_key(
     resource_backend_id: str,
     resource_uuid: Optional[str] = None,
     expose_backend_error_details: bool = True,
-) -> None:
+    key_settings: Optional[dict] = None,
+) -> bool:
     """Rotate one key in the backend, then report the new value to Waldur.
+
+    Returns whether the new value reached Waldur; a failure is reported as
+    ``set_erred`` instead.
 
     A backend whose public identifier rotates together with the secret (an S3
     access key) returns both halves as a dict; one with a stable client_id (an
@@ -2063,6 +2132,12 @@ def rotate_resource_api_key(
     When ``resource_uuid`` is given, the resource's known client_ids travel with the
     rotation so a backend can drop keys Waldur never learned about — the residue of
     an earlier rotation whose reply was lost.
+
+    ``key_settings`` (``limits`` and ``allowed_models``, and ``resource_limits`` when
+    Waldur's resource was read) is passed on to the backend as keyword arguments when
+    given. Only a backend with the per-key lifecycle takes
+    them, to mint a lost key back with its own settings; the others keep the
+    signature they always had, so the caller leaves it out for them.
     """
     known = (
         _known_client_ids(waldur_rest_client, resource_uuid)
@@ -2071,7 +2146,7 @@ def rotate_resource_api_key(
     )
     try:
         result = backend.rotate_resource_key(
-            client_id, resource_backend_id, known_client_ids=known
+            client_id, resource_backend_id, known_client_ids=known, **(key_settings or {})
         )
         # The report is inside the try on purpose. Outside it, a failed set_key left
         # the row Updating with modified unadvanced, which is exactly what the
@@ -2091,4 +2166,5 @@ def rotate_resource_api_key(
             client=waldur_rest_client,
             body=ResourceApiKeySetErredRequest(error_message=error_message),
         )
-        return
+        return False
+    return True

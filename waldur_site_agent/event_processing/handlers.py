@@ -1,6 +1,7 @@
 """Handlers for different events and protocols."""
 
 import json
+import threading
 from typing import Optional
 from uuid import UUID
 
@@ -36,17 +37,18 @@ from waldur_site_agent.backend.backends import (
     DEPARTED_OFFERING_USER_STATES,
     AbstractUsernameManagementBackend,
 )
-from waldur_site_agent.common import agent_identity_management, structures
+from waldur_site_agent.common import agent_identity_management, resource_api_keys, structures
 from waldur_site_agent.common import processors as common_processors
 from waldur_site_agent.common import utils as common_utils
 from waldur_site_agent.event_processing.structures import (
     AccountMessage,
-    ApiKeyRotationMessage,
+    ApiKeyCommandMessage,
     BackendResourceRequestMessage,
     OfferingResourcesSyncMessage,
     OfferingUserMessage,
     OrderMessage,
     PeriodicLimitsMessage,
+    ProjectGroupMessage,
     ResourceMessage,
     UserRoleMessage,
 )
@@ -60,10 +62,9 @@ def register_event_process_service(
     """A shortcut for initialization of the event_process service.
 
     Called at the top of every message handler, before the work the message
-    asks for. The service is telemetry, and the queue is subscribed with
-    ack="auto", so a message whose handler raises is neither requeued nor
-    retried - letting a failed lookup out of here would trade a real order or
-    membership event for a missing agent record. Failures are logged and the
+    asks for. The service is telemetry, and a message whose handler raises is
+    acked without a retry - letting a failed lookup out of here would trade a
+    real order or membership event for a missing agent record. Failures are logged and the
     handler proceeds without a service.
 
     Args:
@@ -233,6 +234,10 @@ def on_user_role_message_stomp(
     message: UserRoleMessage = json.loads(frame.body)
     logger.info("Received message: %s on topic %s", message, frame.headers.get("destination"))
     user_uuid = message.get("user_uuid")
+    # Bound before the try: the except block logs them, and a failure earlier in
+    # the try must surface as itself rather than as an UnboundLocalError.
+    user_username = message.get("user_username")
+    role_granted = message.get("granted")
     project_name = message["project_name"]
     project_uuid = message["project_uuid"]
 
@@ -256,8 +261,9 @@ def on_user_role_message_stomp(
         )
         processor.register(agent_service)
         if user_uuid:
-            user_username = message["user_username"]
-            role_granted = message["granted"]
+            if not user_username:
+                logger.error("Missing required field 'user_username' for user role change")
+                return
             if role_granted is None:
                 logger.error("Missing required field 'granted' for user role change")
                 return
@@ -290,7 +296,7 @@ def on_user_role_message_stomp(
                 processor.process_project_user_sync(project_uuid)
     except Exception as e:
         if user_uuid:
-            logger.error(
+            logger.exception(
                 "Failed to process user %s (%s) role change in project %s (%s) (granted: %s): %s",
                 user_username,
                 user_uuid,
@@ -300,7 +306,7 @@ def on_user_role_message_stomp(
                 e,
             )
         else:
-            logger.error(
+            logger.exception(
                 "Failed to process full project all users sync event for project %s: %s",
                 project_uuid,
                 e,
@@ -356,9 +362,7 @@ def on_offering_resources_sync_message_stomp(
         message.get("requested_by_user_uuid"),
     )
     try:
-        waldur_rest_client = common_utils.get_client(
-            offering.api_url, offering.api_token, user_agent, offering.verify_ssl
-        )
+        waldur_rest_client = common_utils.get_client_for_offering(offering, user_agent)
     except Exception as e:
         logger.exception(
             "Failed to create Waldur client for offering resources sync of %s: %s",
@@ -624,28 +628,26 @@ def on_resource_periodic_limits_update_stomp(
         logger.error("Error processing periodic limits update: %s", e)
 
 
-def on_resource_api_key_rotation_stomp(
+def on_resource_api_key_command_stomp(
     frame: stomp.utils.Frame,
     offering: structures.Offering,
     user_agent: str,
     expose_backend_error_details: bool = True,
 ) -> None:
-    """Handle a resource API key rotation command.
+    """Handle a command about one resource API key.
 
-    The agent generates the key and applies it to the backend, then reports the
-    outcome to Waldur via the provider endpoints. Rotation is the only command:
-    the key count is fixed at provisioning.
+    The payload's ``action`` names the command — create, rotate, pause, resume,
+    update or delete. The agent carries it out on the backend, then acknowledges it
+    through the provider endpoint that answers it; see ``resource_api_keys``.
     """
     try:
-        message: ApiKeyRotationMessage = json.loads(frame.body)
-        action = message.get("action")
-        resource_uuid = message.get("resource_uuid")
-        backend_id = message.get("resource_backend_id")
-        api_key_uuid = message.get("api_key_uuid")
-        client_id = message.get("client_id")
-        logger.info("Processing API key %s for resource %s", action, resource_uuid)
+        message: ApiKeyCommandMessage = json.loads(frame.body)
+        command = resource_api_keys.ApiKeyCommand.from_message(dict(message))
+        logger.info(
+            "Processing API key %s for resource %s", command.action, command.resource_uuid
+        )
 
-        if not resource_uuid or not backend_id:
+        if not command.resource_uuid or not command.resource_backend_id:
             logger.error("Invalid API key message: missing resource_uuid/backend_id")
             return
 
@@ -655,20 +657,10 @@ def on_resource_api_key_rotation_stomp(
             return
 
         waldur_rest_client = common_utils.get_client_for_offering(offering, user_agent)
-
-        if action != "rotate":
-            logger.error("Unknown API key action: %s", action)
-            return
-        if not api_key_uuid or not client_id:
-            logger.error("rotate command missing api_key_uuid/client_id")
-            return
-        common_utils.rotate_resource_api_key(
+        resource_api_keys.execute_api_key_command(
             waldur_rest_client,
-            api_key_uuid,
-            client_id,
             backend,
-            backend_id,
-            resource_uuid,
+            command,
             expose_backend_error_details=expose_backend_error_details,
         )
 
@@ -1019,3 +1011,82 @@ def _add_user_to_resources(
                 )
     except Exception:
         logger.exception("Failed to create associations for user %s", username)
+
+
+# A burst of project-group events -- an import, a backfill numbering every
+# group of a provider -- becomes one pass: the first event schedules it, and
+# the ones arriving before it starts ride along. Every pass reads the whole
+# listing, so nothing an event said is lost by coalescing.
+PROJECT_GROUP_RECONCILE_DELAY_SECONDS = 3.0
+_project_group_timers: dict[str, threading.Timer] = {}
+_project_group_timers_lock = threading.Lock()
+
+
+def on_project_group_message_stomp(
+    frame: stomp.utils.Frame,
+    offering: structures.Offering,
+    user_agent: str,
+    expose_backend_error_details: bool = True,  # noqa: ARG001
+) -> None:
+    """Provider project group event handler for STOMP."""
+    message: ProjectGroupMessage = json.loads(frame.body)
+    logger.info(
+        "Received project group message: %s %s (GID %s)",
+        message.get("action"),
+        message.get("name", ""),
+        message.get("gid"),
+    )
+    schedule_project_group_reconcile(offering, user_agent)
+
+
+def schedule_project_group_reconcile(
+    offering: structures.Offering,
+    user_agent: str,
+    delay: Optional[float] = None,
+) -> bool:
+    """Schedule one project-group pass for the offering; False if one is pending."""
+    key = str(offering.uuid)
+    with _project_group_timers_lock:
+        if key in _project_group_timers:
+            return False
+        timer = threading.Timer(
+            PROJECT_GROUP_RECONCILE_DELAY_SECONDS if delay is None else delay,
+            run_project_group_reconcile,
+            args=(offering, user_agent),
+        )
+        # A pass cut short by shutdown is harmless: the next one converges.
+        timer.daemon = True
+        _project_group_timers[key] = timer
+    timer.start()
+    return True
+
+
+def run_project_group_reconcile(offering: structures.Offering, user_agent: str) -> None:
+    """Run the username backend's project-group pass for the offering.
+
+    The pending marker is cleared before the pass starts, so an event arriving
+    while it runs schedules the next one rather than being absorbed by a pass
+    that may already have read the listing.
+    """
+    with _project_group_timers_lock:
+        pending = _project_group_timers.pop(str(offering.uuid), None)
+    if pending is not None and pending is not threading.current_thread():
+        # Called directly while a pass was scheduled: this one covers it.
+        pending.cancel()
+    try:
+        waldur_rest_client = common_utils.get_client_for_offering(offering, user_agent)
+        register_event_process_service(
+            offering,
+            waldur_rest_client,
+            ObservableObjectTypeEnum.SERVICE_PROVIDER_PROJECT_GROUP,
+        )
+        backend, _ = common_utils.get_username_management_backend(offering)
+        if not backend.reconciles_project_groups():
+            logger.info(
+                "Offering %s does not write project groups; event ignored", offering.name
+            )
+            return
+        logger.info("Running the project group pass for offering %s on events", offering.name)
+        backend.reconcile_project_groups(waldur_rest_client)
+    except Exception:
+        logger.exception("Project group reconcile failed for offering %s", offering.name)

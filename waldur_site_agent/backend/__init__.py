@@ -14,6 +14,17 @@ ACCOUNT_NAME_REGEX = "a-zA-Z0-9-_"
 # common.utils, which has to know the target without asking the backend.
 DEFAULT_RESOURCE_KEY_COUNT = 2
 
+# Alone in a key's ``allowed_models``, it stands for every model, including ones
+# the offering adds later. Shared because it is Waldur's spelling, not a backend's.
+ALL_MODELS = "*"
+
+# A per-key usage report's bucket for usage a backend can tie to the resource but to
+# none of its keys (chat by someone holding no key, say): the resource's backend id
+# with this suffix. Not a key, so the core neither submits it nor warns of it as one
+# Waldur does not hold. Here rather than in common.resource_api_keys, which a plugin
+# module cannot import at load time: common.utils loads the plugins.
+UNASSIGNED_USAGE_SUFFIX = "-unassigned"
+
 
 class BackendType(Enum):
     """Enum for backend types."""

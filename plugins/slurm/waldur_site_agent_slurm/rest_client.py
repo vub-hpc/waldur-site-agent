@@ -2,10 +2,9 @@
 
 Implements ``SlurmClientInterface`` against the slurmrestd
 ``/slurmdb/<version>`` and ``/slurm/<version>`` endpoints instead of
-shelling out to sacctmgr/sacct/scancel. Operations without a direct
-REST equivalent (sacct usage reports, RawUsage reset, local ``id``
-lookups) are delegated to an internal CLI ``SlurmClient`` — see
-docs/slurm-rest-api-design.md.
+shelling out to sacctmgr/sacct/scancel. RawUsage resets (account and
+QoS) have no REST equivalent and are delegated to an internal CLI
+``SlurmClient`` — see docs/slurm-rest-api-design.md.
 
 JSON field paths follow the data_parser plugin conventions: a path like
 ``max/tres/group/minutes`` denotes nested objects
@@ -18,15 +17,14 @@ plain numbers are accepted by the server on input.
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import os
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from shutil import which
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -40,7 +38,8 @@ from waldur_site_agent_slurm.client import (
     SlurmClient,
 )
 from waldur_site_agent_slurm.interface import SlurmClientInterface
-from waldur_site_agent_slurm.parser import SlurmReportLine
+from waldur_site_agent_slurm.parser import SlurmReportLine, pick_usage_tres
+from waldur_site_agent_slurm.schemas import UsageTresSource
 
 # SLURMDB_FS_USE_PARENT in slurm/slurmdb.h — the shares_raw sentinel
 # equivalent to ``sacctmgr ... Share=parent``.
@@ -69,6 +68,29 @@ _ACTIVE_JOB_STATES = frozenset(
 )
 
 _HTTP_UNAUTHORIZED = 401
+
+# Every TRES list of the ASSOC record (data_parser parsers.c ASSOC). slurmrestd
+# treats an association POST as the association's complete TRES state: a list
+# absent from the request is diffed against the stored one and each of its TRES
+# is removed (slurmrestd associations.c _diff_tres). Scalars left out are
+# NO_VAL (unchanged), so only these lists have to be carried on every write.
+_ASSOC_TRES_PATHS = (
+    ("max", "tres", "total"),
+    ("max", "tres", "group", "minutes"),
+    ("max", "tres", "group", "active"),
+    ("max", "tres", "minutes", "total"),
+    ("max", "tres", "minutes", "per", "job"),
+    ("max", "tres", "per", "job"),
+    ("max", "tres", "per", "node"),
+)
+
+# GrpTRESMins of a QoS (data_parser parsers.c QOS). Associations keep it at
+# max/tres/group/minutes; on a QoS that path is an unknown field.
+_QOS_GRP_TRES_MINS_PATH = ("limits", "max", "tres", "minutes", "total")
+
+# slurmdbd's placeholder row that offsets dynamically added TRES ids
+# (accounting_storage_mysql.c); slurmrestd lists it with the real TRES.
+_TRES_PLACEHOLDER_TYPES = frozenset({"dynamic_offset"})
 
 
 def _parse_walltime_minutes(value: str) -> int:
@@ -120,6 +142,7 @@ class SlurmRestClient(SlurmClientInterface):
         cluster_name: str,
         slurm_bin_path: str = "/usr/bin",
         transport: Optional[httpx.BaseTransport] = None,
+        usage_tres_source: UsageTresSource = UsageTresSource.REQUESTED,
     ) -> None:
         """Init REST transport, auth settings and the internal CLI client.
 
@@ -130,12 +153,14 @@ class SlurmRestClient(SlurmClientInterface):
                 payloads always carry an explicit cluster, so this is required.
             slurm_bin_path: path to SLURM binaries for delegated CLI calls.
             transport: optional httpx transport override (used by tests).
+            usage_tres_source: which job TRES usage is billed on, as in CLI mode.
         """
         if not cluster_name:
             msg = "cluster_name is required when SLURM execution_mode is 'rest'"
             raise BackendError(msg)
         self.slurm_tres = slurm_tres
         self.cluster_name: Optional[str] = cluster_name
+        self.usage_tres_source = usage_tres_source
         self._executed_commands: list[str] = []
         # TRES is static for the cluster lifetime; cache it to avoid a
         # GET /tres round trip on every per-user limit write.
@@ -162,7 +187,10 @@ class SlurmRestClient(SlurmClientInterface):
         # CLI client for operations without a REST equivalent (sacct usage
         # reports, RawUsage reset) and for local OS commands (id, homedirs).
         self._cli = SlurmClient(
-            slurm_tres, slurm_bin_path=slurm_bin_path, cluster_name=cluster_name
+            slurm_tres,
+            slurm_bin_path=slurm_bin_path,
+            cluster_name=cluster_name,
+            usage_tres_source=usage_tres_source,
         )
 
     @property
@@ -375,8 +403,25 @@ class SlurmRestClient(SlurmClientInterface):
                 return assoc
         return None
 
-    def _post_association(self, account: str, fields: dict, user: Optional[str] = None) -> str:
-        """Create/update an association identified by account(+user) on this cluster.
+    def _find_association(
+        self, account: str, user: Optional[str] = None, partition: Optional[str] = None
+    ) -> Optional[dict]:
+        """Return the association row the update handler would match, if any."""
+        if not user:
+            return self._get_account_association(account)
+        for assoc in self._list_associations(account=account, user=user):
+            if assoc.get("user") == user and (assoc.get("partition") or "") == (partition or ""):
+                return assoc
+        return None
+
+    def _post_association(
+        self,
+        account: str,
+        fields: dict,
+        user: Optional[str] = None,
+        partition: Optional[str] = None,
+    ) -> str:
+        """Create/update an association identified by account(+user, partition).
 
         ``user`` is a required field of the ASSOC parser (add_parse_req,
         data_parser parsers.c) — omitting it fails the request-body parse.
@@ -384,13 +429,27 @@ class SlurmRestClient(SlurmClientInterface):
         is also how the update handler matches them (it fills unset
         condition fields with empty strings, associations.c
         _foreach_update_assoc).
+
+        Every TRES list the association already has and ``fields`` does not
+        set is sent back unchanged: slurmrestd would otherwise remove it
+        (see ``_ASSOC_TRES_PATHS``), so a fairshare or QoS update would
+        drop the account's limits.
         """
         assoc: dict[str, Any] = {
             "account": account,
             "cluster": self.cluster_name,
             "user": user or "",
         }
-        assoc.update(fields)
+        if partition:
+            assoc["partition"] = partition
+        current = self._find_association(account, user, partition)
+        for path in _ASSOC_TRES_PATHS:
+            if self._dig(fields, *path) is not None:
+                continue
+            stored = self._tres_list_to_dict(self._dig(current, *path))
+            if stored:
+                self._merge(assoc, self._nested(path, self._tres_dict_to_list(stored)))
+        self._merge(assoc, fields)
         self._request("POST", self._db("associations/"), body={"associations": [assoc]})
         return ""
 
@@ -444,13 +503,12 @@ class SlurmRestClient(SlurmClientInterface):
     def validate_slurm_binary(self) -> bool:
         """Verify slurmrestd responds to ping, and guard the delegated CLI.
 
-        REST mode still shells out to sacct/sacctmgr via the internal CLI
-        client for usage reporting and RawUsage reset. When those binaries are
-        present, run the emulator-shadow guard — an emulator (or wrong-path
-        sacct) shadowing the real binary would feed fabricated or zero usage
-        straight to billing while ping happily succeeds. When they're absent,
-        skip the guard: there is nothing to shadow, and execute_command now
-        raises a clear BackendError at usage time rather than fabricating data.
+        REST mode still shells out to sacctmgr via the internal CLI client for
+        RawUsage resets. When the binary is present, run the emulator-shadow
+        guard — an emulator (or wrong-path sacctmgr) shadowing the real binary
+        would silently fake the reset while ping happily succeeds. When it is
+        absent, skip the guard: there is nothing to shadow, and the reset raises
+        a clear BackendError instead.
         """
         try:
             self._request("GET", self._ctld("ping/"))
@@ -717,9 +775,13 @@ class SlurmRestClient(SlurmClientInterface):
             template.update(association_fields)
         if template:
             condition["association"] = template
-        body: dict[str, Any] = {"association_condition": condition}
+        # ``user`` is required (add_parse_req in data_parser parsers.c
+        # OPENAPI_USERS_ADD_COND_RESP) and is a USER_SHORT, whose default
+        # account field is the flat ``defaultaccount``.
+        user: dict[str, Any] = {}
         if default_account:
-            body["user"] = {"default": {"account": default_account}}
+            user["defaultaccount"] = default_account
+        body: dict[str, Any] = {"association_condition": condition, "user": user}
         self._request("POST", self._db("users_association/"), body=body)
         return ""
 
@@ -801,7 +863,9 @@ class SlurmRestClient(SlurmClientInterface):
                     msg = f"Invalid SLURM partition name: {name!r}"
                     raise BackendError(msg)
             sorted_parts = sorted(partitions)
-        association_fields: dict[str, Any] = {"qoslevel": ",".join(qos_list)}
+        # ``qoslevel`` is a QOS_STRING_ID_LIST: a comma-joined string is only
+        # warned about and the whole request then adds nothing.
+        association_fields: dict[str, Any] = {"qoslevel": list(qos_list)}
         if default_qos is not None:
             association_fields["defaultqos"] = default_qos
         return self._add_user_associations(
@@ -831,8 +895,17 @@ class SlurmRestClient(SlurmClientInterface):
         )
 
     def get_user_default_account(self, username: str) -> Optional[str]:
-        """The user's default account from ``GET /slurmdb/{v}/user/{name}``, if known."""
-        payload = self._request("GET", self._db(f"user/{quote(username)}"), allow_errors=True)
+        """The user's default account from ``GET /slurmdb/{v}/user/{name}``, if known.
+
+        slurmdbd derives the default account from the user's default
+        association and only does so when associations are requested
+        (as_mysql_user.c), so ``with_assocs`` is required.
+        """
+        # A bare flag: slurmrestd reads any value as a string and warns, and
+        # an empty value is false.
+        payload = self._request(
+            "GET", self._db(f"user/{quote(username)}") + "?with_assocs", allow_errors=True
+        )
         users = payload.get("users") or []
         if not users:
             return None
@@ -855,13 +928,15 @@ class SlurmRestClient(SlurmClientInterface):
         slurmdbd refuses to remove a user's *default* association while the
         user keeps others, so the default is moved to one of the remaining
         accounts first. When this is the user's last association the user
-        record goes with it (``sacctmgr remove user`` semantics).
+        record goes too (``sacctmgr remove user`` semantics): removing only
+        the association would leave the record behind. The association is
+        removed first either way, because a user can hold associations
+        without a user record (``POST /associations`` does not create one),
+        and then ``DELETE /user`` answers 304 and removes nothing -- both
+        seen on a 25.11.7 slurmrestd.
         """
         accounts = self.list_user_accounts(username)
         remaining = [account for account in accounts if account != resource_id.lower()]
-        if accounts and not remaining:
-            logger.info("Removing user %s: %s was its last association", username, resource_id)
-            return self.delete_user(username)
         if remaining and self.get_user_default_account(username) == resource_id.lower():
             logger.info(
                 "Moving default account of %s from %s to %s before removing the association",
@@ -874,6 +949,9 @@ class SlurmRestClient(SlurmClientInterface):
         if self.cluster_name:
             query["cluster"] = self.cluster_name
         self._request("DELETE", self._db("associations/"), query=query)
+        if accounts and not remaining:
+            logger.info("Removing user %s: %s was its last association", username, resource_id)
+            self.delete_user(username)
         return ""
 
     def list_resource_users(self, resource_id: str) -> list[str]:
@@ -990,6 +1068,25 @@ class SlurmRestClient(SlurmClientInterface):
         if qos_name not in qos_list:
             qos_list.append(qos_name)
             self._post_association(account, {"qos": qos_list})
+        self._grant_qos_to_user_associations(account, qos_name)
+
+    def _grant_qos_to_user_associations(self, account: str, qos_name: str) -> None:
+        """Add the QoS to every user association of the account that lacks it.
+
+        ``sacctmgr ... set qos+=`` is a delta slurmdbd also applies to child
+        associations. A REST write replaces the account row's list only, so a
+        user association holding its own QoS list would never get the QoS, and
+        making it the account's DefaultQOS would then be refused because those
+        associations "don't have access to their default qos".
+        """
+        for assoc in self._list_associations(account=account):
+            user = assoc.get("user")
+            current = list(assoc.get("qos") or [])
+            if not user or qos_name in current:
+                continue
+            self._post_association(
+                account, {"qos": [*current, qos_name]}, user=user, partition=assoc.get("partition")
+            )
 
     def set_account_default_qos(self, account: str, qos_name: str) -> None:
         """Set the default QoS for the account."""
@@ -999,7 +1096,7 @@ class SlurmRestClient(SlurmClientInterface):
         """Set GrpTRESMins on the named QoS via slurmrestd.
 
         slurmrestd replaces the whole TRES list at
-        ``limits/max/tres/group/minutes``. Read-merge the incoming values over
+        ``limits/max/tres/minutes/total``. Read-merge the incoming values over
         the current list so unmentioned TRES (e.g. usage-based statics written
         at create time) survive later partial updates — same parity goal as
         ``set_account_limits``.
@@ -1008,7 +1105,7 @@ class SlurmRestClient(SlurmClientInterface):
         merged.update({key: int(value) for key, value in limits_dict.items()})
         tres = self._tres_dict_to_list(merged)
         qos: dict[str, Any] = {"name": qos_name}
-        self._merge(qos, self._nested(("limits", "max", "tres", "group", "minutes"), tres))
+        self._merge(qos, self._nested(_QOS_GRP_TRES_MINS_PATH, tres))
         self._request("POST", self._db("qos/"), body={"qos": [qos]})
 
     def get_qos_grp_tres_mins(self, qos_name: str) -> dict[str, int]:
@@ -1017,9 +1114,7 @@ class SlurmRestClient(SlurmClientInterface):
         qos_list = payload.get("qos") or []
         if not qos_list:
             return {}
-        return self._tres_list_to_dict(
-            self._dig(qos_list[0], "limits", "max", "tres", "group", "minutes")
-        )
+        return self._tres_list_to_dict(self._dig(qos_list[0], *_QOS_GRP_TRES_MINS_PATH))
 
     def reset_qos_raw_usage(self, qos_name: str) -> None:
         """Reset QoS RawUsage — delegated to sacctmgr (no REST equivalent)."""
@@ -1063,7 +1158,11 @@ class SlurmRestClient(SlurmClientInterface):
         """Return a list of TRES available in the cluster."""
         payload = self._request("GET", self._db("tres/"))
         tres_objects = payload.get("TRES") or payload.get("tres") or []
-        return [self._tres_key(tres) for tres in tres_objects]
+        return [
+            self._tres_key(tres)
+            for tres in tres_objects
+            if tres.get("type") not in _TRES_PLACEHOLDER_TYPES
+        ]
 
     def _cached_tres_keys(self) -> list[str]:
         """Return TRES keys, fetching once and caching for the client lifetime."""
@@ -1154,38 +1253,34 @@ class SlurmRestClient(SlurmClientInterface):
     ) -> list[SlurmReportLine]:
         """Per-user usage for the current month, from ``GET /slurmdb/{v}/jobs/``.
 
-        The sacct equivalent is ``--allocations --allusers --accounts=...
-        --format=Account,ReqTRES,Elapsed,User`` over the month. Each job record
-        is rendered into the same ``Account|TRES|Elapsed|User`` line so the
-        parser and everything downstream stay shared with the CLI client.
+        The sacct equivalent is ``--truncate --allocations --allusers
+        --accounts=... --format=Account,ReqTRES,Elapsed,User`` over the month,
+        and the result is meant to be the same number: each job record is
+        rendered into the same ``Account|TRES|Elapsed|User`` line so the parser
+        and everything downstream stay shared with the CLI client.
         """
         month_start, month_end = backend_utils.format_current_month(timezone or "")
-        return self._usage_lines(resource_ids, month_start, month_end, timezone)
+        return self._usage_lines(resource_ids, month_start, month_end)
 
     def get_historical_usage_report(
         self, resource_ids: list[str], year: int, month: int
     ) -> list[SlurmReportLine]:
         """Per-user usage for a past month, from ``GET /slurmdb/{v}/jobs/``."""
         month_start, month_end = backend_utils.format_month_period(year, month)
-        return self._usage_lines(resource_ids, month_start, month_end, None)
+        return self._usage_lines(resource_ids, month_start, month_end)
 
     @staticmethod
-    def _window_epochs(start_time: str, end_time: str, timezone: Optional[str]) -> tuple[int, int]:
-        """The report window as epoch seconds.
+    def _window_epochs(start_time: str, end_time: str) -> tuple[int, int]:
+        """The report window as epoch seconds, read in the agent host's local time.
 
-        The window strings are naive, in the offering's timezone (system-local
-        when none is set) -- the same reading sacct gives them. slurmdb job
-        times are epoch seconds, so the clip below needs both on one scale.
+        The offering's timezone only picks which dates the window covers
+        (``format_current_month``); the CLI client hands those naive strings
+        to sacct, which reads them in the host's local time (``parse_time``),
+        so this does the same. slurmdb job times are epoch seconds, so the
+        clip below needs both on one scale.
         """
-        tz: Optional[datetime.tzinfo] = None
-        if timezone:
-            with contextlib.suppress(Exception):
-                tz = ZoneInfo(timezone)
         start = datetime.datetime.fromisoformat(start_time)
         end = datetime.datetime.fromisoformat(end_time)
-        if tz is not None:
-            start = start.replace(tzinfo=tz)
-            end = end.replace(tzinfo=tz)
         return int(start.timestamp()), int(end.timestamp())
 
     def _usage_lines(
@@ -1193,21 +1288,28 @@ class SlurmRestClient(SlurmClientInterface):
         resource_ids: list[str],
         start_time: str,
         end_time: str,
-        timezone: Optional[str],
     ) -> list[SlurmReportLine]:
         if not resource_ids:
             return []
-        window = self._window_epochs(start_time, end_time, timezone)
+        window = self._window_epochs(start_time, end_time)
         query: dict[str, str] = {
             "account": ",".join(resource_ids),
-            "start_time": start_time,
-            "end_time": end_time,
+            # Epochs, not the naive strings: slurmrestd would read those in its
+            # own timezone, which need not be the agent host's.
+            "start_time": str(window[0]),
+            "end_time": str(window[1]),
+            # sacct's --allocations. Setting any job-condition flag also stops
+            # slurmrestd from defaulting to show_duplicates and
+            # disable_truncate_usage_time, so slurmdbd truncates usage time and
+            # drops superseded records exactly as it does for sacct --truncate
+            # (slurm://src/slurmrestd/plugins/openapi/slurmdbd/jobs.c#op_handler_jobs).
+            "skip_steps": "true",
         }
         if self.cluster_name:
             query["cluster"] = self.cluster_name
         payload = self._request("GET", self._db("jobs/"), query=query)
         wanted = set(resource_ids)
-        lines = []
+        jobs = []
         for job in payload.get("jobs") or []:
             account = job.get("account") or ""
             # Re-filter client-side: older slurmrestd ignore unknown query params.
@@ -1215,10 +1317,54 @@ class SlurmRestClient(SlurmClientInterface):
                 continue
             if self.cluster_name and job.get("cluster") not in (None, "", self.cluster_name):
                 continue
+            jobs.append(job)
+        lines = []
+        for job in self._latest_records(jobs):
             line = self._job_to_report_line(job, window)
             if line is not None:
                 lines.append(line)
         return lines
+
+    @staticmethod
+    def _db_job_states(job: dict) -> set[str]:
+        """States of a slurmdb job record (``state.current``, unlike slurmctld's ``job_state``)."""
+        state = job.get("state")
+        current = state.get("current") if isinstance(state, dict) else state
+        if isinstance(current, str):
+            return {current}
+        return set(current or [])
+
+    @classmethod
+    def _latest_records(cls, jobs: list[dict]) -> list[dict]:
+        """Keep one record per job ID, as sacct does without ``--duplicates``.
+
+        A requeued job leaves one record per run under the same job ID. slurmdbd
+        returns only the most recently submitted one, plus records left in
+        RESIZING, and never a revoked federated sibling
+        (slurm://src/plugins/accounting_storage/mysql/as_mysql_jobacct_process.c).
+        slurmdbd already does this when the query carries a job-condition flag;
+        repeating it here keeps a server that ignores the flag in line.
+        """
+        latest: dict[object, dict] = {}
+        for job in jobs:
+            job_id = job.get("job_id")
+            if job_id is None or "REVOKED" in cls._db_job_states(job):
+                continue
+            submitted = cls._time_field((job.get("time") or {}).get("submission")) or 0
+            current = latest.get(job_id)
+            if current is None or submitted > (
+                cls._time_field((current.get("time") or {}).get("submission")) or 0
+            ):
+                latest[job_id] = job
+        kept = []
+        for job in jobs:
+            states = cls._db_job_states(job)
+            if "REVOKED" in states:
+                continue
+            job_id = job.get("job_id")
+            if job_id is None or latest.get(job_id) is job or "RESIZING" in states:
+                kept.append(job)
+        return kept
 
     @staticmethod
     def _time_field(value: object) -> Optional[int]:
@@ -1235,9 +1381,17 @@ class SlurmRestClient(SlurmClientInterface):
 
         A job that spans a month boundary is billed to each month only for the
         part inside it; without this a 56h job crossing the boundary would be
-        charged 56h in both months. A running job has no end yet and is taken
-        as running until the window closes, like sacct does. Jobs without a
-        start time cannot be placed and keep their raw elapsed.
+        charged 56h in both months. As in slurmdbd, the window never extends
+        past now, so a job still running is billed up to now and not to the
+        end of the month. Jobs without a start time cannot be placed and keep
+        their raw elapsed.
+
+        slurmdbd already truncates when the query carries a job-condition flag,
+        and also takes suspended time off ``elapsed``; the clip is repeated for
+        a server that ignores the flag. ``elapsed`` never exceeds the clipped
+        span when slurmdbd truncated, and is the job's whole run time when it
+        did not, so the smaller of the two keeps the suspended-time correction
+        without billing time outside the window.
         """
         times = job.get("time") or {}
         elapsed = cls._time_field(times.get("elapsed"))
@@ -1246,27 +1400,32 @@ class SlurmRestClient(SlurmClientInterface):
         start = cls._time_field(times.get("start"))
         if not start:
             return elapsed
+        window_start = window[0]
+        window_end = min(window[1], int(time.time()))
         end = cls._time_field(times.get("end"))
-        if not end:
-            end = max(start + elapsed, window[1])
-        window_start, window_end = window
-        return max(0, min(end, window_end) - max(start, window_start))
+        if not end or end > window_end:
+            end = window_end
+        clipped = max(0, end - max(start, window_start))
+        return min(clipped, elapsed)
 
     def _job_to_report_line(
         self, job: dict, window: tuple[int, int]
     ) -> Optional[SlurmReportLine]:
-        """Render one slurmdb job record as a sacct ``Account|ReqTRES|Elapsed|User`` line.
+        """Render one slurmdb job record as a sacct ``Account|TRES|Elapsed|User`` line.
 
-        ``tres.allocated`` is what the job actually held (``requested`` is the
-        fallback for jobs that never started). Memory is in MB on the wire and
-        sacct prints it with an ``M`` suffix, which the parser expects.
+        ``tres.requested`` is sacct's ReqTRES and ``tres.allocated`` its
+        AllocTRES; ``pick_usage_tres`` chooses between them as the CLI client
+        does. Memory is in MB on the wire and sacct prints it with an ``M``
+        suffix, which the parser expects.
         """
         user = job.get("user") or job.get("user_name") or ""
         elapsed = self._truncated_elapsed(job, window)
         if not user or elapsed is None:
             return None
         tres_section = job.get("tres") or {}
-        tres_list = tres_section.get("allocated") or tres_section.get("requested")
+        tres_list = pick_usage_tres(
+            self.usage_tres_source, tres_section.get("allocated"), tres_section.get("requested")
+        )
         tres = self._tres_list_to_dict(tres_list)
         pairs = []
         for key in sorted(tres):

@@ -19,10 +19,11 @@ import abc
 import datetime
 import math
 import time as _time
+from collections.abc import Collection
 from enum import Enum
 from http import HTTPStatus
 from time import sleep
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, Callable, ClassVar, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -176,7 +177,13 @@ from waldur_site_agent.backend.backends import (
 )
 from waldur_site_agent.backend.exceptions import BackendError
 from waldur_site_agent.backend.structures import BackendResourceInfo
-from waldur_site_agent.common import agent_identity_management, structures, utils
+from waldur_site_agent.common import (
+    agent_identity_management,
+    resource_api_keys,
+    spending_limits,
+    structures,
+    utils,
+)
 from waldur_site_agent.common.healthz import touch_heartbeat
 from waldur_site_agent.common.structures import AccountType
 
@@ -204,6 +211,39 @@ def _is_transient_waldur_api_error(e: Exception) -> bool:
         e.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
         or e.status_code == HTTPStatus.TOO_MANY_REQUESTS
     )
+
+
+#: How many failed users a user-sync failure log line names before summarising the rest.
+_MAX_FAILED_USERS_IN_MESSAGE = 10
+
+
+def _describe_failed_users(verb: str, failed: object) -> str:
+    """One clause for the user-sync failure log line: the users, capped, and the first cause."""
+    if not isinstance(failed, dict) or not failed:
+        return ""
+    names = sorted(failed)
+    shown = ", ".join(names[:_MAX_FAILED_USERS_IN_MESSAGE])
+    more = len(names) - _MAX_FAILED_USERS_IN_MESSAGE
+    if more > 0:
+        shown += f" and {more} more"
+    first = names[0]
+    return (
+        f"could not {verb} {len(names)} user(s): {shown} "
+        f"(first error, {first}: {failed[first]})"
+    )
+
+
+_TERMINAL_ORDER_STATES = frozenset(
+    {OrderState.DONE, OrderState.CANCELED, OrderState.REJECTED, OrderState.ERRED}
+)
+
+
+def _url_is_under(url: httpx.URL, base: httpx.URL) -> bool:
+    """Whether url is base or below it, comparing normalised scheme, host, port and path."""
+    if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
+        return False
+    base_path = base.path.rstrip("/")
+    return url.path == base_path or url.path.startswith(base_path + "/")
 
 
 def _serialize_attr_value(val: object) -> object:
@@ -342,6 +382,15 @@ class OfferingBaseProcessor(abc.ABC):
                 client=self.waldur_rest_client,
                 field=[ServiceProviderFieldEnum.UUID],
             )
+            if not service_providers:
+                # Typically a personal access token bound to the offering only:
+                # Waldur hides the offering's service provider from it.
+                raise backend_exceptions.ConfigurationError(
+                    f"No service provider of offering {self.offering.name} is visible to "
+                    "the configured Waldur API token. If it is a personal access token, "
+                    "bind it to the service provider or leave it unbound; a binding on "
+                    "the offering alone is not enough."
+                )
             service_provider = service_providers[0]
 
         self.service_provider = service_provider
@@ -362,6 +411,8 @@ class OfferingBaseProcessor(abc.ABC):
         self._offering_users_cache: list[OfferingUser] | None = None
         # Unfiltered username set used when preserve_unmanaged_backend_users is on.
         self._known_offering_usernames_cache: Optional[set[str]] = None
+        # Set when the unfiltered fetch fails; remaining resources skip the retry.
+        self._known_offering_usernames_fetch_failed: bool = False
 
     def _print_current_user(self) -> None:
         """Log information about the current authenticated Waldur user."""
@@ -544,6 +595,7 @@ class OfferingBaseProcessor(abc.ABC):
         """
         self._offering_users_cache = None
         self._known_offering_usernames_cache = None
+        self._known_offering_usernames_fetch_failed = False
 
     def _check_backend_id_uniqueness(self, backend_id: str) -> bool:
         """Check if backend_id is unique across offering history.
@@ -1005,15 +1057,39 @@ class OfferingOrderProcessor(OfferingBaseProcessor):
                 break
             except (UnexpectedStatus, httpx.TransportError) as e:
                 self.log_order_processing_error(order, e)
-                logger.info("Retrying order %s processing in %s seconds", order_info.uuid, delay)
-                sleep(delay)
-
-        if attempt_number == retry_count - 1:
+                if attempt_number < retry_count - 1:
+                    logger.info(
+                        "Retrying order %s processing in %s seconds", order_info.uuid, delay
+                    )
+                    sleep(delay)
+        else:
             logger.error(
                 "Failed to process order %s after %s retries, skipping to the next one",
                 order_info.uuid,
                 retry_count,
             )
+
+    def _current_order_state(self, order: OrderDetails) -> Optional[OrderState]:
+        """Waldur's current state of the order, or the local one if it cannot be read.
+
+        The order object passed to process_order is fetched before provisioning
+        and goes stale once the agent sets it done.
+        """
+        try:
+            refreshed = marketplace_orders_retrieve.sync(
+                client=self.waldur_rest_client,
+                uuid=order.uuid.hex,
+                field=[OrderDetailsFieldEnum.UUID, OrderDetailsFieldEnum.STATE],
+            )
+        except Exception as e:
+            logger.warning(
+                "Unable to refresh order %s state, using the local one (%s): %s",
+                order.uuid,
+                order.state,
+                e,
+            )
+            return order.state
+        return refreshed.state if refreshed is not None else order.state
 
     def process_order(self, order: OrderDetails) -> None:
         """Process a single order through its complete lifecycle.
@@ -1147,7 +1223,18 @@ class OfferingOrderProcessor(OfferingBaseProcessor):
 
                 logger.info("The order %s has been successfully processed", order.uuid)
 
-                self._post_process_order(order)
+                try:
+                    self._post_process_order(order)
+                except Exception as e:
+                    # The backend did its part and the order is done; erring it
+                    # now would misreport a working resource. Users and accounts
+                    # left unsynced here are picked up by membership sync.
+                    logger.exception(
+                        "Post-processing of done order %s failed, leaving the order done; "
+                        "membership sync will retry: %s",
+                        order.uuid,
+                        e,
+                    )
             else:
                 logger.warning(
                     "Order %s processing was not finished (order_is_done=False), "
@@ -1192,7 +1279,10 @@ class OfferingOrderProcessor(OfferingBaseProcessor):
                 order.state,
                 e,
             )
-            if order.state != OrderState.DONE:
+            current_state = self._current_order_state(order)
+            # Re-read: the local order is stale. An order Waldur already finished
+            # (done, canceled, rejected, erred) must not be overwritten with ERRED.
+            if current_state not in _TERMINAL_ORDER_STATES:
                 error_message, error_traceback = utils.format_waldur_error_details(
                     e, self.expose_backend_error_details
                 )
@@ -1215,8 +1305,9 @@ class OfferingOrderProcessor(OfferingBaseProcessor):
                     )
             else:
                 logger.warning(
-                    "Order %s is already in DONE state, not setting to erred",
+                    "Order %s is already in terminal state %s, not setting it to erred",
                     order.uuid,
+                    current_state,
                 )
 
     def _create_resource(
@@ -1320,22 +1411,33 @@ class OfferingOrderProcessor(OfferingBaseProcessor):
     ) -> None:
         """Generate the resource's API keys and report each to Waldur.
 
-        The agent decides the count (both plugins make two so one can be rotated
-        with no downtime). Keys are reported as they are applied, so a failure
+        The agent decides the count. By default it is two, so one can be rotated
+        with no downtime. Keys are reported as they are applied, so a failure
         part-way leaves the already-reported keys usable and the rest unminted;
-        there is no add command, so a shortfall is only recovered by a restore.
+        without per-key management there is no add command, so a shortfall is
+        only recovered by a restore.
         Runs on both fresh creates and restores/re-creates — a restored resource
         has no keys (they were removed on terminate), so it must be re-provisioned
         or it would come back with no way to authenticate.
+
+        Where the offering manages keys one by one and the backend can mint a key
+        on request, none are minted: users request their own keys, and a
+        replacement can be requested before the old key is deleted, so the pair is
+        not what makes rotation safe there. It would only add two shared keys with
+        no assignee and no limits. Stale keys are still cleared either way.
         """
         if not getattr(self.resource_backend, "supports_resource_api_keys", False):
             return
+        minted_on_request = resource_api_keys.manages_api_keys(waldur_resource) and getattr(
+            self.resource_backend, "supports_resource_api_key_lifecycle", False
+        )
         try:
             utils.provision_resource_api_keys(
                 self.waldur_rest_client,
                 waldur_resource.uuid.hex,
                 backend_resource_info.backend_id,
                 self.resource_backend,
+                count=0 if minted_on_request else None,
             )
         except Exception as e:
             logger.warning("Failed to provision the resource API keys: %s", e)
@@ -1877,6 +1979,8 @@ def fetch_offering_resources(
             ResourceFieldEnum.END_DATE,
             ResourceFieldEnum.END_DATE_UPDATED_AT,
             ResourceFieldEnum.PROJECT_END_DATE,
+            # For backends that mirror per-period spending limits onto the backend.
+            *spending_limits.resource_fields(),
         ],
     }
 
@@ -2183,6 +2287,25 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
         )
 
         self._process_resources(resource_report)
+        self._reconcile_offering_in_username_backend()
+
+    def _reconcile_offering_in_username_backend(self) -> None:
+        """Run the username backend's offering-wide reconcile, once per pass.
+
+        Separate from the profile sync, which only runs with a non-empty
+        offering-user list: an offering whose last account is gone still has
+        directory state to clean up.
+        """
+        try:
+            username_management_backend, _ = utils.get_username_management_backend(self.offering)
+            if (
+                type(username_management_backend).reconcile_offering
+                is AbstractUsernameManagementBackend.reconcile_offering
+            ):
+                return
+            username_management_backend.reconcile_offering(self.waldur_rest_client)
+        except Exception:
+            logger.exception("Offering reconcile failed for %s", self.offering.name)
 
     def _fetch_source_project(self, waldur_resource: WaldurResource) -> Optional[Project]:
         """Pre-fetch the source project for backends that mirror project metadata.
@@ -2774,8 +2897,8 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
         count as Waldur-managed so it gets removed -- see gh-13. Restricted offering
         users are included for the same reason.
 
-        Only called when preserve_unmanaged_backend_users is on. Fail closed: a
-        fetch error propagates so that resource skips removals this cycle.
+        Only called from _group_resource_usernames when preserve_unmanaged_backend_users
+        is on. Raises on failure; the caller applies a confirmed-managed fallback.
         """
         if self._known_offering_usernames_cache is None:
             offering_users = marketplace_offering_users_list.sync_all(
@@ -3096,16 +3219,46 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
             and self.offering.preserve_unmanaged_backend_users
             and not use_identity_bridge
         ):
-            known_usernames = self._get_known_offering_usernames()
-            unmanaged = stale_usernames - known_usernames
-            stale_usernames &= known_usernames
-            if unmanaged:
-                logger.info(
-                    "Preserving %s backend user(s) unknown to Waldur on resource %s: %s",
-                    len(unmanaged),
-                    waldur_resource.backend_id,
-                    ", ".join(sorted(unmanaged)),
-                )
+            candidates = set(stale_usernames)
+            used_known_fetch_fallback = False
+            if self._known_offering_usernames_fetch_failed:
+                stale_usernames &= offering_user_usernames
+                used_known_fetch_fallback = True
+            else:
+                try:
+                    known_usernames = self._get_known_offering_usernames()
+                except Exception as exc:
+                    self._known_offering_usernames_fetch_failed = True
+                    stale_usernames &= offering_user_usernames
+                    used_known_fetch_fallback = True
+                    logger.error(
+                        "Unable to fetch unfiltered offering-user list for offering %s, "
+                        "using confirmed-managed removals only for resource %s this cycle: %s",
+                        self.offering.uuid,
+                        waldur_resource.backend_id,
+                        exc,
+                        exc_info=True,
+                    )
+                else:
+                    unmanaged = stale_usernames - known_usernames
+                    stale_usernames &= known_usernames
+                    if unmanaged:
+                        logger.info(
+                            "Preserving %s backend user(s) unknown to Waldur on resource %s: %s",
+                            len(unmanaged),
+                            waldur_resource.backend_id,
+                            ", ".join(sorted(unmanaged)),
+                        )
+            if used_known_fetch_fallback:
+                deferred = candidates - stale_usernames
+                if deferred:
+                    logger.error(
+                        "Deferring removal of %d backend user(s) on resource %s "
+                        "(unfiltered offering-user list unavailable): %s",
+                        len(deferred),
+                        waldur_resource.backend_id,
+                        ", ".join(sorted(deferred)),
+                    )
         logger.info(
             "Resource stale usernames (%s): %s", len(stale_usernames), ", ".join(stale_usernames)
         )
@@ -3158,6 +3311,12 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
     ) -> set[str]:
         """Sync users for the resource between Waldur and the site.
 
+        Users the backend failed to add or remove (reported through the
+        ``failed`` attribute of the backend's result) are logged at ERROR with
+        their cause and retried on the next pass. They do not mark the resource
+        ERRED and do not hold back ``last_sync``: one member's problem is not a
+        failure of an allocation that works for everyone else.
+
         return: the actual resource usernames (existing + added)
         """
         logger.info("Syncing user list for resource %s", waldur_resource.name)
@@ -3180,12 +3339,13 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
                 "Resource is restricted for members, removing all the existing associations"
             )
 
-            self.resource_backend.remove_users_from_resource(
+            removed_usernames = self.resource_backend.remove_users_from_resource(
                 waldur_resource,
                 existing_usernames,
                 user_cuids=user_cuids,
                 user_roles=user_roles,
             )
+            self._log_user_sync_failures(waldur_resource, set(), removed_usernames)
             return set()
 
         added_usernames = self.resource_backend.add_users_to_resource(
@@ -3205,6 +3365,8 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
             user_cuids=user_cuids,
             user_roles=user_roles,
         )
+        # Logged before the steps below so a later error cannot lose them.
+        self._log_user_sync_failures(waldur_resource, added_usernames, removed_usernames)
         self._release_departed_users(
             self._confirmed_removals(stale_usernames, removed_usernames, waldur_resource)
         )
@@ -3218,9 +3380,47 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
             user_cuids,
         )
 
+        # After the members: an assignee has to be a provisioned member before the
+        # backend can act for them.
+        try:
+            resource_api_keys.sync_key_assignees(
+                self.waldur_rest_client, self.resource_backend, waldur_resource, offering_users
+            )
+        except Exception:
+            logger.exception(
+                "Unable to sync the API key assignees of resource %s (%s)",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+            )
+
         self._report_membership_sync_statuses(waldur_resource)
 
         return existing_usernames | added_usernames
+
+    def _log_user_sync_failures(
+        self,
+        waldur_resource: WaldurResource,
+        added_usernames: Collection[str],
+        removed_usernames: Collection[str],
+    ) -> None:
+        """Log the users the backend failed to add or remove, with the cause.
+
+        Only logged: the users are retried on the next pass and the resource
+        state is left alone. Backends whose results carry no ``failed`` mapping
+        (their own add/remove implementations) report nothing here.
+        """
+        clauses = [
+            clause
+            for verb, result in (("add", added_usernames), ("remove", removed_usernames))
+            if (clause := _describe_failed_users(verb, getattr(result, "failed", None)))
+        ]
+        if clauses:
+            logger.error(
+                "User sync for resource %s (%s) is incomplete: %s",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+                "; ".join(clauses),
+            )
 
     def _report_membership_sync_statuses(self, waldur_resource: WaldurResource) -> None:
         """Post the backend's per-grant sync report to Waldur, if any.
@@ -3304,6 +3504,46 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
                     waldur_resource.name,
                     waldur_resource.backend_id,
                     exc,
+                )
+
+    def reconcile_resource_statuses(self) -> None:
+        """Re-apply every resource's paused/downscaled/restored status on the backend.
+
+        Event mode applies a status change when its resource message arrives; this
+        pass catches a message that was lost or failed. Each resource is re-read just
+        before it is applied, so a flag the message worker applied meanwhile is not
+        overwritten with the listing's older value, and a resource that left the
+        handled states since the listing is skipped. One failure is logged and the
+        rest still run; it never marks a resource ERRED — the membership path owns
+        that. The liveness heartbeat is touched per resource so a long pass cannot
+        outlive the probe window.
+        """
+        waldur_resources = self._get_waldur_resources()
+        logger.info(
+            "Reconciling the status of %d resource(s) of offering %s",
+            len(waldur_resources),
+            self.offering.name,
+        )
+        for listed in waldur_resources:
+            touch_heartbeat()
+            try:
+                waldur_resource = marketplace_provider_resources_retrieve.sync(
+                    uuid=listed.uuid.hex, client=self.waldur_rest_client
+                )
+                if waldur_resource.state not in self.resource_backend.handled_resource_states:
+                    logger.info(
+                        "Resource %s (%s) is now %s, skipping its status reconciliation",
+                        listed.name,
+                        listed.backend_id,
+                        waldur_resource.state,
+                    )
+                    continue
+                self._sync_resource_status(waldur_resource)
+            except Exception:
+                logger.exception(
+                    "Unable to reconcile the status of resource %s (%s)",
+                    listed.name,
+                    listed.backend_id,
                 )
 
     def _sync_resource_status(self, waldur_resource: WaldurResource) -> None:
@@ -3423,6 +3663,151 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
                     exc,
                 )
 
+    def _is_own_waldur_api_error(self, e: Exception) -> bool:
+        """Whether this is a client error (4xx) from this agent's own Waldur API.
+
+        Waldur-to-Waldur backends talk to a remote Waldur with the same client
+        library, so the status alone is not enough: the response must come from
+        this client's base URL, and not from a remote Waldur the backend declares
+        (which may share the origin, e.g. served under a path or on loopback).
+        3xx (e.g. an http->https redirect) and transient errors are not "own".
+        """
+        if not isinstance(e, UnexpectedStatus):
+            return False
+        if not HTTPStatus.BAD_REQUEST <= e.status_code < HTTPStatus.INTERNAL_SERVER_ERROR:
+            return False
+        if e.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+            return False
+        try:
+            own_base = self.waldur_rest_client.get_httpx_client().base_url
+        except Exception:
+            return False
+        error_url = httpx.URL(str(e.url))
+        remote_bases = []
+        remote_base_urls = getattr(self.resource_backend, "remote_waldur_base_urls", None)
+        if callable(remote_base_urls):
+            remote_bases = [httpx.URL(url) for url in remote_base_urls()]
+        if any(_url_is_under(error_url, remote) for remote in remote_bases):
+            return False
+        return _url_is_under(error_url, own_base)
+
+    def _sync_resource(
+        self,
+        waldur_resource: WaldurResource,
+        backend_resource_info: BackendResourceInfo,
+        offering_users: list[OfferingUser],
+    ) -> None:
+        """Run every sync step for one resource.
+
+        ERRED is reserved for backend failures. A step that fails because this
+        Waldur's own API refused a request (a 4xx on reading per-user limits,
+        listing service accounts, syncing end dates, ...) is skipped and logged;
+        the remaining steps still run and the resource state is left alone. Any
+        other exception — a backend error, or a remote Waldur's error for
+        Waldur-to-Waldur backends — propagates and marks the resource ERRED.
+
+        An ERRED resource is set back to OK once every backend step ran, even
+        if bookkeeping was skipped. last_sync is refreshed only when every step
+        ran, so it does not claim a sync that was partial.
+        """
+        skipped_steps: list[str] = []
+
+        def run_step(step_name: str, func: Callable[..., Any], *args: Any) -> tuple[bool, Any]:  # noqa: ANN401
+            try:
+                return True, func(*args)
+            except UnexpectedStatus as e:
+                if not self._is_own_waldur_api_error(e):
+                    raise
+                skipped_steps.append(step_name)
+                logger.error(
+                    "Waldur API error during %s for resource %s (%s), skipping the step "
+                    "and keeping the resource state: %s",
+                    step_name,
+                    waldur_resource.name,
+                    waldur_resource.backend_id,
+                    e,
+                )
+                return False, None
+
+        project_fetched, source_project = run_step(
+            "source project fetch", self._fetch_source_project, waldur_resource
+        )
+        if project_fetched:
+            run_step(
+                "project sync",
+                self.resource_backend.sync_resource_project,
+                waldur_resource,
+                source_project,
+            )
+            run_step(
+                "project end date sync",
+                self.resource_backend.sync_project_end_date,
+                waldur_resource,
+                self.waldur_rest_client,
+                source_project,
+            )
+        users_synced, resource_usernames = run_step(
+            "user sync",
+            self._sync_resource_users,
+            waldur_resource,
+            backend_resource_info,
+            offering_users,
+        )
+        run_step("service account sync", self._sync_resource_service_accounts, waldur_resource)
+        run_step("course account sync", self._sync_resource_course_accounts, waldur_resource)
+        run_step("status sync", self._sync_resource_status, waldur_resource)
+        run_step(
+            "resource end date sync",
+            self.resource_backend.sync_resource_end_date,
+            waldur_resource,
+            self.waldur_rest_client,
+        )
+        run_step(
+            "effective id sync",
+            self.resource_backend.sync_resource_effective_id,
+            waldur_resource,
+            self.waldur_rest_client,
+        )
+        run_step("limits sync", self._sync_resource_limits, waldur_resource)
+        if users_synced:
+            run_step(
+                "user limits sync",
+                self._sync_resource_user_limits,
+                waldur_resource,
+                resource_usernames,
+            )
+
+        if skipped_steps:
+            logger.warning(
+                "Resource %s (%s) synced partially, skipped: %s; not refreshing last sync",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+                ", ".join(skipped_steps),
+            )
+        else:
+            logger.info(
+                "Refreshing resource %s (%s) last sync",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+            )
+            marketplace_provider_resources_refresh_last_sync.sync_detailed(
+                uuid=waldur_resource.uuid.hex,
+                client=self.waldur_rest_client,
+            )
+        # Every backend step ran (a backend failure would have raised), so a
+        # resource erred by an earlier cycle is healthy again even if some
+        # Waldur-side bookkeeping was skipped.
+        if waldur_resource.state == ResourceState.ERRED:
+            logger.info(
+                "Setting resource %s (%s) state to OK",
+                waldur_resource.name,
+                waldur_resource.backend_id,
+            )
+            marketplace_provider_resources_set_as_ok.sync_detailed(
+                uuid=waldur_resource.uuid.hex,
+                client=self.waldur_rest_client,
+            )
+
     def _process_resources(
         self,
         resource_report: dict[str, tuple[WaldurResource, BackendResourceInfo]],
@@ -3445,51 +3830,20 @@ class OfferingMembershipProcessor(OfferingBaseProcessor):
             if index % _HEARTBEAT_BATCH_SIZE == 0:
                 touch_heartbeat()
             try:
-                source_project = self._fetch_source_project(waldur_resource)
-                self.resource_backend.sync_resource_project(waldur_resource, source_project)
-                self.resource_backend.sync_project_end_date(
-                    waldur_resource, self.waldur_rest_client, source_project
-                )
-                resource_usernames = self._sync_resource_users(
-                    waldur_resource, backend_resource_info, offering_users
-                )
-                self._sync_resource_service_accounts(waldur_resource)
-                self._sync_resource_course_accounts(waldur_resource)
-                self._sync_resource_status(waldur_resource)
-                self.resource_backend.sync_resource_end_date(
-                    waldur_resource, self.waldur_rest_client
-                )
-                self.resource_backend.sync_resource_effective_id(
-                    waldur_resource, self.waldur_rest_client
-                )
-                self._sync_resource_limits(waldur_resource)
-                self._sync_resource_user_limits(waldur_resource, resource_usernames)
-
-                logger.info(
-                    "Refreshing resource %s (%s) last sync",
-                    waldur_resource.name,
-                    waldur_resource.backend_id,
-                )
-
-                marketplace_provider_resources_refresh_last_sync.sync_detailed(
-                    uuid=waldur_resource.uuid.hex,
-                    client=self.waldur_rest_client,
-                )
-                if waldur_resource.state == ResourceState.ERRED:
-                    logger.info(
-                        "Setting resource %s (%s) state to OK",
-                        waldur_resource.name,
-                        waldur_resource.backend_id,
-                    )
-                    marketplace_provider_resources_set_as_ok.sync_detailed(
-                        uuid=waldur_resource.uuid.hex,
-                        client=self.waldur_rest_client,
-                    )
+                self._sync_resource(waldur_resource, backend_resource_info, offering_users)
             except Exception as e:
                 if _is_transient_waldur_api_error(e):
                     # Handle transient Waldur API errors.
                     logger.warning(
                         "Transient Waldur API error while processing allocation %s, "
+                        "keeping resource state unchanged: %s",
+                        waldur_resource.backend_id,
+                        e,
+                    )
+                    continue
+                if self._is_own_waldur_api_error(e):
+                    logger.error(
+                        "Waldur API error while processing allocation %s, "
                         "keeping resource state unchanged: %s",
                         waldur_resource.backend_id,
                         e,
@@ -3601,6 +3955,7 @@ class OfferingReportProcessor(OfferingBaseProcessor):
         resource_backend_version: Optional[str] = None,
         reporting_periods: int = 1,
         expose_backend_error_details: bool = True,
+        api_key_final_report_days: int = resource_api_keys.FINAL_REPORT_DAYS,
     ) -> None:
         """Initialize the report processor.
 
@@ -3614,6 +3969,8 @@ class OfferingReportProcessor(OfferingBaseProcessor):
                 (1 = current month only, 2 = current + previous).
             expose_backend_error_details: Whether to forward raw exception
                 details to Waldur when marking objects as ERRED.
+            api_key_final_report_days: Days into a month during which each API
+                key's usage for the previous month is reported once more.
         """
         super().__init__(
             offering,
@@ -3624,6 +3981,7 @@ class OfferingReportProcessor(OfferingBaseProcessor):
             expose_backend_error_details=expose_backend_error_details,
         )
         self.reporting_periods = reporting_periods
+        self.api_key_final_report_days = api_key_final_report_days
 
     @staticmethod
     def _compute_reporting_periods(
@@ -3683,6 +4041,7 @@ class OfferingReportProcessor(OfferingBaseProcessor):
             uuid=self.offering.uuid,
             field=[ProviderOfferingDetailsFieldEnum.COMPONENTS],
         )
+        self._warn_without_api_key_daily_usage(waldur_offering)
         waldur_resources = marketplace_provider_resources_list.sync_all(
             client=self.waldur_rest_client,
             offering_uuid=[self.offering.uuid],
@@ -3814,6 +4173,7 @@ class OfferingReportProcessor(OfferingBaseProcessor):
         waldur_components: list[OfferingComponent],
         report_date: Optional[datetime.datetime] = None,
         billing_period_start: Optional[datetime.date] = None,
+        daily_usage: Optional[dict[str, dict[str, float]]] = None,
     ) -> list[str]:
         """Reports total usage for a backend resource to Waldur.
 
@@ -3835,6 +4195,11 @@ class OfferingReportProcessor(OfferingBaseProcessor):
             report_date: Datetime to use as the report date. Defaults to current time.
             billing_period_start: Date of the billing period start. Defaults to
                 first day of report_date's month.
+            daily_usage: The period's usage per UTC day, ``{date: {component: usage}}``,
+                when both the backend and Waldur take it per day. Usage-based components
+                in it are then reported per day (``daily_usages``) instead of as a month
+                total: Waldur derives their month from the days, and refuses a month total
+                beside them. The comparisons above still use the month totals.
 
         Returns:
             Component types omitted from ``set_usage`` because they decreased.
@@ -4000,14 +4365,35 @@ class OfferingReportProcessor(OfferingBaseProcessor):
         # inventing a zero would be accurate. A later client release replaces
         # `recurring` with an explicit `missing_usage_policy` enum, where `none`
         # stays the intended value.
+        by_day: set[str] = set()
+        if daily_usage is not None:
+            # Only usage-based components take days, and only those the days cover:
+            # one the backend reported no days for keeps its month total.
+            by_day = (
+                spending_limits.usage_based_types(waldur_components)
+                & set(total_usage)
+                & {component for usages in daily_usage.values() for component in usages}
+            )
         usage_objects = [
             ComponentUsageItemRequest(type_=component, amount=f"{amount:.2f}")
             for component, amount in total_usage.items()
-            if component in component_types
+            if component in component_types and component not in by_day
         ]
         request_body = ComponentUsageCreateRequest(
             usages=usage_objects, resource=resource_uuid, date=report_date
         )
+        if by_day and daily_usage is not None:
+            days = spending_limits.fill_days(
+                daily_usage,
+                billing_period_start.year,
+                billing_period_start.month,
+                by_day,
+                spending_limits.utc_today(),
+            )
+            # Sent as extra JSON, which a client that predates the field still writes.
+            request_body.additional_properties["daily_usages"] = (
+                spending_limits.daily_usage_items(days)
+            )
         marketplace_component_usages_set_usage.sync_detailed(
             client=self.waldur_rest_client, body=request_body
         )
@@ -4231,10 +4617,17 @@ class OfferingReportProcessor(OfferingBaseProcessor):
                 # A past-period 400 is expected when the backend refuses to
                 # backfill usage-based components (their usage would create
                 # retroactive invoice items) — that is benign, skip the period.
+                # Reported per day, Waldur takes a past month's days from the
+                # service provider while that month's invoice can still change, and
+                # refuses them with the second message once it cannot.
                 # Any other 400 (e.g. components not present on the offering)
                 # is a real misconfiguration and must be surfaced, not masked.
                 response_text = e.content.decode(errors="ignore")
-                if "backfilling past billing periods" in response_text:
+                # The second is the same refusal for usage reported per day.
+                if (
+                    "backfilling past billing periods" in response_text
+                    or "Usage of a past month can only be reported" in response_text
+                ):
                     logger.info(
                         "Past period %04d-%02d skipped for resource %s: backend "
                         "does not allow backfilling usage-based components",
@@ -4272,6 +4665,96 @@ class OfferingReportProcessor(OfferingBaseProcessor):
                     resource_backend_id,
                     exc_info=True,
                 )
+
+        self._report_api_key_usages(waldur_resource, waldur_offering)
+
+    def _warn_without_api_key_daily_usage(self, waldur_offering: ProviderOfferingDetails) -> None:
+        """Say so when the backend reports per-key usage per day but the offering does not.
+
+        Waldur offers day and week limits on an offering's API keys only where its
+        ``api_key_daily_usage`` plugin option is on, since they are enforced against
+        usage per key per day; without it a key gets month and total limits alone. Nothing about
+        the report changes: this only tells the provider what turning it on would give.
+        Skipped for a Waldur that takes no usage per day, which has no such option, and
+        for an offering whose keys take no limits of their own (``api_key_limits`` off).
+        """
+        backend = self.resource_backend
+        if getattr(backend, "supports_daily_usage", False) is not True:
+            return
+        if getattr(backend, "supports_resource_api_key_usage", False) is not True:
+            return
+        if not spending_limits.accepts_daily_usage(waldur_offering.components):
+            return
+        plugin_options = getattr(self.waldur_offering, "plugin_options", None)
+        if spending_limits.generated_field(plugin_options, "api_key_limits") is False:
+            return
+        if spending_limits.generated_field(plugin_options, "api_key_daily_usage") is True:
+            return
+        logger.warning(
+            "Offering %s does not declare api_key_daily_usage, so Waldur offers only "
+            "month and total limits on its API keys; turn it on to offer day and week "
+            "limits.",
+            self.offering.uuid,
+        )
+
+    def _report_api_key_usages(
+        self, waldur_resource: WaldurResource, waldur_offering: ProviderOfferingDetails
+    ) -> None:
+        """Report the usage per API key, where both sides support it.
+
+        The current month's, and in the first ``api_key_final_report_days`` days of a
+        month the previous month's final figures too.
+
+        Waldur enforces a key's limits against this. Best-effort: the resource's own
+        usage is already reported, and a failure here must not re-run it.
+        """
+        if not getattr(self.resource_backend, "supports_resource_api_key_usage", False):
+            return
+        if not resource_api_keys.manages_api_keys(waldur_resource):
+            return
+        component_types = [
+            component.type_
+            for component in waldur_offering.components or []
+            if component.type_ and component.type_ in self.resource_backend.backend_components
+        ]
+        if not component_types:
+            return
+        try:
+            resource_api_keys.report_api_key_usages(
+                self.waldur_rest_client,
+                self.resource_backend,
+                waldur_resource.uuid.hex,
+                waldur_resource.backend_id,
+                component_types,
+                final_report_days=getattr(
+                    self, "api_key_final_report_days", resource_api_keys.FINAL_REPORT_DAYS
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to report per-key usage for resource %s", waldur_resource.backend_id
+            )
+
+    def _daily_usage(
+        self,
+        resource_backend_id: str,
+        waldur_offering: ProviderOfferingDetails,
+        year: int,
+        month: int,
+    ) -> Optional[dict[str, dict[str, float]]]:
+        """The period's usage per UTC day where the backend and Waldur both take it; else None.
+
+        Day and week spending limits are checked against it. A Waldur without per-day
+        usage keeps getting month totals, as before.
+        """
+        if getattr(self.resource_backend, "supports_daily_usage", False) is not True:
+            return None
+        if not spending_limits.accepts_daily_usage(waldur_offering.components):
+            return None
+        report = self.resource_backend.get_daily_usage_report_for_period(
+            [resource_backend_id], year, month
+        )
+        return report.get(resource_backend_id, {})
 
     def _process_resource_period(
         self,
@@ -4332,6 +4815,7 @@ class OfferingReportProcessor(OfferingBaseProcessor):
             waldur_offering.components,
             report_date=report_date,
             billing_period_start=billing_period_start,
+            daily_usage=self._daily_usage(resource_backend_id, waldur_offering, year, month),
         )
 
         # Skip per-user usage if the dict is empty

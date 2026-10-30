@@ -117,25 +117,65 @@ class PeriodicLimitsMessage(TypedDict):
     timestamp: str
 
 
-class ApiKeyRotationMessage(TypedDict):
-    """A command to reconcile one of a resource's API keys.
+class ApiKeyCommandMessage(TypedDict, total=False):
+    """A command about one of a resource's API keys.
+
+    Carried on the ``resource_api_key_rotation`` observable type, which is named for
+    the first command and kept so subscriptions do not change.
 
     Attributes:
-        action (str): ``rotate`` — the key count is fixed at provisioning
+        action (str): ``create``, ``rotate``, ``pause``, ``resume``, ``update`` or
+            ``delete`` (mastermind's ``ResourceApiKeyActions``)
         resource_uuid (str): UUID of the resource in Waldur
         resource_backend_id (str): backend id the key client-ids derive from
-        api_key_uuid (Optional[str]): the ResourceApiKey to act on
-        client_id (Optional[str]): the key's gateway client-id
+        api_key_uuid (str): the ResourceApiKey to act on
+        client_id (str): the key's backend client-id; blank on a key being created
+        limits (Optional[dict]): the key's limits per component, on create, resume
+            and update
+        allowed_models (Optional[list]): the models the key may call, on create,
+            resume and update: ``["*"]`` for every model, an empty list for none.
+            None, from a Waldur older than ``["*"]``, allows every model. The
+            key's own list narrowed by its resource's model selection
 
-    The two key fields are optional because this is parsed straight from an
-    untrusted frame body; the handler rejects a command missing either.
+    Every field is optional because this is parsed straight from an untrusted frame
+    body; the handler rejects a command missing what its action needs.
     """
 
     action: str
     resource_uuid: str
     resource_backend_id: str
-    api_key_uuid: Optional[str]
-    client_id: Optional[str]
+    api_key_uuid: str
+    client_id: str
+    limits: Optional[dict]
+    allowed_models: Optional[list]
+
+
+class ProjectGroupMessage(TypedDict, total=False):
+    """Represents a message for provider project group events.
+
+    Attributes:
+        action (str): "create" (the group got its first GID), "update" (its name
+            or GID changed), "delete", or "switch" (project groups switched on or
+            off for the provider)
+        service_provider_uuid (str): UUID of the service provider
+        customer_uuid (str): UUID of the provider's organization
+        project_group_uuid (str): UUID of the group (not on "switch")
+        project_uuid (Optional[str]): UUID of the group's project, if it still exists
+        name (str): Group name
+        gid (Optional[int]): Group GID
+        changed_fields (list[str]): Fields that changed ("update" only)
+        project_groups_enabled (bool): The new setting ("switch" only)
+    """
+
+    action: str
+    service_provider_uuid: str
+    customer_uuid: str
+    project_group_uuid: str
+    project_uuid: Optional[str]
+    name: str
+    gid: Optional[int]
+    changed_fields: list[str]
+    project_groups_enabled: bool
 
 
 class OfferingUserMessage(TypedDict):

@@ -46,6 +46,13 @@ class TestReportingPeriodsConfig(unittest.TestCase):
         with self.assertRaises(ValidationError):
             WaldurAgentConfiguration(reporting_periods=13)
 
+    def test_api_key_final_report_days(self) -> None:
+        assert WaldurAgentConfiguration().api_key_final_report_days == 3
+        assert WaldurAgentConfiguration(api_key_final_report_days=0).api_key_final_report_days == 0
+        for invalid in (-1, 29):
+            with self.assertRaises(ValidationError):
+                WaldurAgentConfiguration(api_key_final_report_days=invalid)
+
     def test_root_config_threads_through(self) -> None:
         raw_config = RootConfiguration(
             offerings=[
@@ -59,9 +66,11 @@ class TestReportingPeriodsConfig(unittest.TestCase):
                 }
             ],
             reporting_periods=3,
+            api_key_final_report_days=5,
         )
         agent_config = raw_config.to_agent_configuration()
         assert agent_config.reporting_periods == 3
+        assert agent_config.api_key_final_report_days == 5
 
     def test_root_config_default(self) -> None:
         raw_config = RootConfiguration(
@@ -367,6 +376,28 @@ class TestMultiPeriodProcessorFlow(unittest.TestCase):
 
         It should be logged at INFO and must not block the current period.
         """
+        self._assert_past_period_rejection_is_info(
+            {
+                "date": [
+                    "Service providers can only specify date for "
+                    "limit-based or prepaid billing components when "
+                    "backfilling past billing periods."
+                ]
+            }
+        )
+
+    def test_past_period_days_rejection_skipped_as_info(self) -> None:
+        """The same refusal for a past month's usage reported per day."""
+        self._assert_past_period_rejection_is_info(
+            {
+                "daily_usages": [
+                    "Usage of a past month can only be reported by staff, or by the "
+                    "service provider while that month's invoice can still change."
+                ]
+            }
+        )
+
+    def _assert_past_period_rejection_is_info(self, rejection: dict) -> None:
         self._setup_common_mocks()
 
         self.mock_backend.pull_resource.return_value = BackendResourceInfo(
@@ -382,16 +413,7 @@ class TestMultiPeriodProcessorFlow(unittest.TestCase):
             f"{self.BASE_URL}/api/marketplace-component-usages/set_usage/"
         ).mock(
             side_effect=[
-                httpx.Response(
-                    400,
-                    json={
-                        "date": [
-                            "Service providers can only specify date for "
-                            "limit-based or prepaid billing components when "
-                            "backfilling past billing periods."
-                        ]
-                    },
-                ),
+                httpx.Response(400, json=rejection),
                 httpx.Response(201, json={}),
             ]
         )
