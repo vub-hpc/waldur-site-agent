@@ -17,6 +17,10 @@ from waldur_site_agent.common.plugin_schemas import (
     PluginComponentSchema,
 )
 
+# Lustre stores project IDs as u32, and both lfs and the kernel reject
+# 2**32 - 1 (INVALID_PROJID), so this is the largest usable project ID.
+LUSTRE_MAX_PROJECT_ID = 2**32 - 2
+
 
 class SlurmLimitType(Enum):
     """Enumeration of SLURM limit types for periodic limits."""
@@ -36,6 +40,19 @@ class ExecutionMode(str, Enum):
 
     CLI = "cli"
     REST = "rest"
+
+
+class UsageTresSource(str, Enum):
+    """Which of a job's TRES its usage is billed on.
+
+    ``requested`` is sacct's ReqTRES, ``allocated`` its AllocTRES. They differ
+    when the scheduler hands a job more than it asked for (whole cores on SMT
+    nodes, ``DefCpuPerGPU``, exclusive nodes), and only AllocTRES names the
+    GPU type picked for a request that did not name one.
+    """
+
+    REQUESTED = "requested"
+    ALLOCATED = "allocated"
 
 
 class SlurmComponentSchema(PluginComponentSchema):
@@ -144,7 +161,9 @@ class QosManagementConfig(PluginBackendSettingsSchema):
 class LustreQuotaConfig(PluginBackendSettingsSchema):
     """Lustre filesystem quota configuration."""
 
-    model_config = ConfigDict(extra="allow")
+    # Forbid unknown keys so a misspelt project_id_offset is reported instead of
+    # silently leaving project IDs on the raw GID. The backend reads no other keys.
+    model_config = ConfigDict(extra="forbid")
 
     mount_point: str = Field(default="/valhalla", description="Lustre mount point")
     block_softlimit: Optional[int] = Field(
@@ -155,6 +174,17 @@ class LustreQuotaConfig(PluginBackendSettingsSchema):
     )
     inode_softlimit: Optional[int] = Field(default=None, description="Inode soft limit")
     inode_hardlimit: Optional[int] = Field(default=None, description="Inode hard limit")
+    project_id_offset: int = Field(
+        default=0,
+        ge=0,
+        le=LUSTRE_MAX_PROJECT_ID,
+        strict=True,
+        description=(
+            "Added to the project group's LDAP GID to form the Lustre project ID, "
+            "so project directories stay clear of project IDs the site assigns "
+            "elsewhere (e.g. home directories tagged by UID). Default 0 uses the GID."
+        ),
+    )
 
 
 class ProjectDirectoryConfig(PluginBackendSettingsSchema):
@@ -277,13 +307,23 @@ class SlurmBackendSettingsSchema(HomedirSettingsSchema):
         default=ExecutionMode.CLI,
         description=(
             "How to talk to SLURM: 'cli' (sacctmgr/sacct binaries, default) or "
-            "'rest' (slurmrestd REST API; usage reporting still uses sacct — "
-            "see docs/slurm-rest-api-design.md)"
+            "'rest' (slurmrestd REST API, including usage reporting; only RawUsage "
+            "resets still run sacctmgr — see docs/slurm-rest-api-design.md)"
         ),
     )
     rest_api: Optional[SlurmRestApiConfig] = Field(
         default=None,
         description="slurmrestd connection settings, required when execution_mode is 'rest'",
+    )
+    usage_tres_source: UsageTresSource = Field(
+        default=UsageTresSource.REQUESTED,
+        description=(
+            "TRES that job usage is billed on, in both execution modes: 'requested' "
+            "(sacct ReqTRES, default) or 'allocated' (sacct AllocTRES, falling back "
+            "to ReqTRES for jobs that never started). 'allocated' attributes "
+            "untyped GPU requests to the allocated gres/gpu:<type>, but also bills "
+            "CPUs the scheduler added beyond the request"
+        ),
     )
 
     # Optional: default partition for user associations

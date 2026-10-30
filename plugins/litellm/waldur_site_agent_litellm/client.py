@@ -40,6 +40,16 @@ _MISSING_ENTITY_MARKERS = ("does not exist", "not found", "no user found")
 # them: the management one stamps them, the reporting one resolves usage through them.
 META_RESOURCE = "waldur_resource"
 META_USERNAME = "waldur_username"
+# The dated history behind ``waldur_resource``: which resource owned the address on
+# which days, so usage already recorded keeps billing where it was used after the
+# address is released or moves. See ``ownership``.
+META_OWNERSHIP = "waldur_ownership"
+# On an offering whose keys are managed one by one, the person's chat follows their
+# key: this holds the alias of the resource key assigned to them, or "" for none. Its
+# presence is what says the person's chat follows a key at all; a user without it is
+# on membership-based chat. The management backend stamps it, the reporting backend
+# puts the person's chat usage on that key.
+META_KEY = "waldur_api_key"
 
 
 def verify_ssl_setting(backend_settings: dict) -> bool:
@@ -239,10 +249,16 @@ class LiteLLMClient:
         blocked: bool = False,
         max_budget: Optional[float] = None,
         budget_duration: Optional[str] = None,
+        budget_limits: Optional[list] = None,
         tpm_limit: Optional[int] = None,
         rpm_limit: Optional[int] = None,
+        metadata: Optional[dict] = None,
     ) -> dict:
         """Mint a key and return the proxy's response.
+
+        ``budget_limits`` are the key's budget windows, ``[{max_budget,
+        budget_duration}]``; sent only when there are some, since a proxy that
+        predates windows may refuse the field.
 
         No ``key`` is sent, so LiteLLM generates the material itself. That keeps the
         plugin working against a proxy with ``disable_custom_api_keys`` set, and
@@ -261,10 +277,14 @@ class LiteLLMClient:
             body["max_budget"] = max_budget
         if budget_duration is not None:
             body["budget_duration"] = budget_duration
+        if budget_limits:
+            body["budget_limits"] = [dict(window) for window in budget_limits]
         if tpm_limit is not None:
             body["tpm_limit"] = tpm_limit
         if rpm_limit is not None:
             body["rpm_limit"] = rpm_limit
+        if metadata:
+            body["metadata"] = dict(metadata)
 
         payload = self._request("POST", "/key/generate", json_body=body)
         if not isinstance(payload, dict) or not payload.get("key"):

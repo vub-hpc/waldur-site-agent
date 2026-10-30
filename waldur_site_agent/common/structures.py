@@ -23,6 +23,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
@@ -167,7 +168,13 @@ class Offering(BaseModel):
 
     name: str = Field(..., description="Human-readable name for the offering")
     waldur_api_url: str = Field(..., description="Base URL for the Waldur API endpoint")
-    waldur_api_token: str = Field(default="", description="Authentication token for Waldur API")
+    # Credentials carry the same {"secret": True} marker as plugin settings
+    # (plugin_schemas.SECRET, not imported here: the two modules import each other lazily).
+    waldur_api_token: str = Field(
+        default="",
+        description="Authentication token for Waldur API",
+        json_schema_extra={"secret": True},
+    )
     waldur_offering_uuid: str = Field(..., description="UUID of the offering in Waldur")
 
     # OIDC authentication (used when waldur_api_token is blank)
@@ -176,7 +183,9 @@ class Offering(BaseModel):
         default=None, description="OIDC client ID for token requests"
     )
     oidc_client_secret: Optional[str] = Field(
-        default=None, description="OIDC client secret for obtaining access tokens"
+        default=None,
+        description="OIDC client secret for obtaining access tokens",
+        json_schema_extra={"secret": True},
     )
 
     # Backend configuration
@@ -239,15 +248,49 @@ class Offering(BaseModel):
         ),
     )
 
+    # Copied from the root-level global_proxy by the config loader, so every client
+    # built from an offering -- including in event mode, where handlers only see the
+    # offering -- goes through the configured proxy. Not an offering-level setting.
+    _global_proxy: str = PrivateAttr(default="")
+
+    @property
+    def global_proxy(self) -> str:
+        """Proxy URL for Waldur API connections, from the root-level global_proxy."""
+        return self._global_proxy
+
     @model_validator(mode="after")
     def validate_auth_config(self) -> Offering:
         """Validate that either a static token or full OIDC config is provided."""
         has_token = bool(self.waldur_api_token)
-        has_oidc = all([self.oidc_token_url, self.oidc_client_id, self.oidc_client_secret])
+        oidc_values = [self.oidc_token_url, self.oidc_client_id, self.oidc_client_secret]
+        has_oidc = all(oidc_values)
+        if any(oidc_values) and not has_oidc:
+            msg = (
+                "oidc_token_url, oidc_client_id and oidc_client_secret must be set "
+                "together; only some of them are set"
+            )
+            raise ValueError(msg)
         if not has_token and not has_oidc:
             msg = (
                 "Either waldur_api_token or all of oidc_token_url, "
                 "oidc_client_id, oidc_client_secret must be set"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def validate_stomp_auth(self) -> Offering:
+        """Reject STOMP event processing for offerings without a static token.
+
+        RabbitMQ authenticates the STOMP session with the agent's static API
+        token as the passcode. An OIDC-only offering has no such token, so the
+        broker refuses the login and the offering would receive no events.
+        """
+        if self.stomp_enabled and not self.waldur_api_token:
+            msg = (
+                "stomp_enabled requires waldur_api_token: the STOMP session is "
+                "authenticated with the static API token, which an OIDC-only offering "
+                "does not have. Use polling mode or configure waldur_api_token."
             )
             raise ValueError(msg)
         return self
@@ -383,6 +426,15 @@ class WaldurAgentConfiguration(BaseModel):
         le=12,
         description="Number of billing periods to report (1=current, 2=current+previous)",
     )
+    api_key_final_report_days: int = Field(
+        default=3,
+        ge=0,
+        le=28,
+        description=(
+            "Days into a month during which each API key's usage for the previous month "
+            "is reported once more (0=off)"
+        ),
+    )
     expose_backend_error_details: bool = Field(
         default=True,
         description=(
@@ -472,6 +524,10 @@ class RootConfiguration(BaseModel):
     and handles the transformation to WaldurAgentConfiguration.
     """
 
+    # Root-level values can carry credentials (a proxy URL with user:password@);
+    # keep them out of validation errors, which end up in logs and Sentry.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     offerings: list[dict[str, Any]] = Field(..., description="Raw offering configurations")
     sentry_dsn: Optional[str] = Field(
         default=None, description="Sentry DSN for error reporting (URL)"
@@ -491,6 +547,15 @@ class RootConfiguration(BaseModel):
         le=12,
         description="Number of billing periods to report (1=current, 2=current+previous)",
     )
+    api_key_final_report_days: int = Field(
+        default=3,
+        ge=0,
+        le=28,
+        description=(
+            "Days into a month during which each API key's usage for the previous month "
+            "is reported once more (0=off)"
+        ),
+    )
     expose_backend_error_details: bool = Field(
         default=True,
         description=(
@@ -504,6 +569,35 @@ class RootConfiguration(BaseModel):
         default_factory=LogShippingConfig,
         description="Configuration for shipping agent logs to Waldur",
     )
+
+    @field_validator("global_proxy")
+    @classmethod
+    def validate_global_proxy(cls, v: str) -> str:
+        """Accept only proxy schemes httpx can use; warn about https and the WebSocket."""
+        if not v:
+            return v
+        # Imported here: the event-processing package imports stomp/websocket.
+        from waldur_site_agent.event_processing.ws_proxy import (  # noqa: PLC0415
+            SUPPORTED_PROXY_SCHEMES,
+            redacted_proxy,
+        )
+
+        scheme = v.split("://", 1)[0].lower() if "://" in v else ""
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            msg = (
+                f"global_proxy {redacted_proxy(v) if scheme else '(no scheme)'} is not supported; "
+                f"use one of: {', '.join(sorted(SUPPORTED_PROXY_SCHEMES))}"
+            )
+            raise ValueError(msg)
+        if scheme == "https":
+            logger.warning(
+                "global_proxy %s is an https proxy: REST calls use it, but the event-mode "
+                "STOMP WebSocket cannot and connects without it (http_proxy/https_proxy "
+                "environment variables still apply). Use an http:// or socks5:// proxy "
+                "to route the WebSocket too.",
+                redacted_proxy(v),
+            )
+        return v
 
     @field_validator("sentry_dsn")
     @classmethod
@@ -551,14 +645,14 @@ class RootConfiguration(BaseModel):
             # Convert backend_components dict to BackendComponent instances
             if "backend_components" in offering_data:
                 components = {}
-                backend_type = offering_data.get("backend_type", "")
+                from waldur_site_agent.common import plugin_schemas  # noqa: PLC0415
+
+                backend_names = plugin_schemas.offering_backend_names(offering_data)
 
                 for name, component_data in offering_data["backend_components"].items():
-                    # Apply plugin-specific validation if available
-                    from waldur_site_agent.common import plugin_schemas  # noqa: PLC0415
-
-                    validated_data = plugin_schemas.validate_component_with_plugin_schema(
-                        backend_type, name, component_data
+                    # Apply the schemas of every backend the offering uses
+                    validated_data = plugin_schemas.validate_component_for_backends(
+                        backend_names, name, component_data
                     )
                     components[name] = BackendComponent(**validated_data)
                 offering_data["backend_components"] = components
@@ -567,13 +661,15 @@ class RootConfiguration(BaseModel):
             if "backend_settings" in offering_data:
                 from waldur_site_agent.common import plugin_schemas  # noqa: PLC0415
 
-                backend_type = offering_data.get("backend_type", "")
-                validated_settings = plugin_schemas.validate_backend_settings_with_plugin_schema(
-                    backend_type, offering_data["backend_settings"]
+                validated_settings = plugin_schemas.validate_backend_settings_for_backends(
+                    plugin_schemas.offering_backend_names(offering_data),
+                    offering_data["backend_settings"],
                 )
                 offering_data["backend_settings"] = validated_settings
 
-            parsed_offerings.append(Offering(**offering_data))
+            offering = Offering(**offering_data)
+            offering._global_proxy = self.global_proxy
+            parsed_offerings.append(offering)
 
         return WaldurAgentConfiguration(
             offerings=parsed_offerings,
@@ -583,6 +679,7 @@ class RootConfiguration(BaseModel):
             global_proxy=self.global_proxy,
             log_level=self.log_level,
             reporting_periods=self.reporting_periods,
+            api_key_final_report_days=self.api_key_final_report_days,
             expose_backend_error_details=self.expose_backend_error_details,
             log_shipping=self.log_shipping,
         )

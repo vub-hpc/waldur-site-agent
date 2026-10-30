@@ -1,6 +1,6 @@
 [project]
 name = "waldur-site-agent"
-version = "1.0.8rc4"
+version = "1.0.8rc12"
 description = "Agent for integrating service provider's site with Waldur Mastermind."
 authors = [{ name = "OpenNode Team", email = "info@opennodecloud.com" }]
 requires-python = ">=3.9.2, <4.0"
@@ -12,16 +12,18 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "httpx>=0.28.1,<0.29",
+    "httpx[socks]>=0.28.1,<0.29",
     "pyyaml==6.0.1",
     "sentry-sdk==2.8.0",
     "elastic-apm>=6.0.0,<7",
 
     "stomp-py>=8.2.0,<9",
+    # SOCKS proxies for the STOMP WebSocket (websocket-client uses python-socks).
+    "python-socks>=2.4,<3",
     "importlib-metadata>=8.7.0 ; python_full_version == '3.9.*'",
     "pydantic>=2.0.0",
     "structlog>=25.4.0",
-    "waldur-api-client==8.1.3rc10.dev259",
+    "waldur-api-client==8.1.3rc23.dev20261010084617",
 ]
 
 [project.urls]
@@ -38,6 +40,7 @@ waldur_sync_offering_users = "waldur_site_agent.common.utils:sync_offering_users
 waldur_sync_resource_limits = "waldur_site_agent.common.utils:sync_resource_limits"
 waldur_site_test_order = "waldur_site_agent.testing.cli:main"
 waldur_site_load_historical_usage = "waldur_site_agent.common.historical_usage_loader:main"
+waldur_site_export_plugin_catalogue = "waldur_site_agent.common.plugin_catalogue:main"
 
 [dependency-groups]
 dev = [
@@ -71,13 +74,13 @@ build-backend = "hatchling.build"
 [tool.poe.tasks]
 pre.cmd = "uvx prek run --all-files"
 pre.help = "Run pre-commit checks"
-mypy.cmd = "mypy py_maker/**/*.py tests/**/*.py --strict"
+mypy.cmd = "uvx prek run mypy --all-files"
 mypy.help = "Run mypy checks"
 format.cmd = "ruff format ."
 format.help = "Format code with Ruff"
 ruff.cmd = "ruff check waldur_site_agent --fix"
 ruff.help = "Run Ruff checks"
-markdown.cmd = "pymarkdown scan -r py_maker/**/[!CHANGELOG,!.github/]*.md docs/**/*.md"
+markdown.cmd = "uvx prek run pymarkdown --all-files"
 markdown.help = "Run markdown checks"
 
 [tool.ruff]

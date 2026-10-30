@@ -23,7 +23,11 @@ from waldur_site_agent.common.component_mapping import ComponentMapper
 from waldur_site_agent_slurm import utils
 from waldur_site_agent_slurm.client import SlurmClient
 from waldur_site_agent_slurm.interface import SlurmClientInterface
-from waldur_site_agent_slurm.schemas import ExecutionMode
+from waldur_site_agent_slurm.schemas import (
+    LUSTRE_MAX_PROJECT_ID,
+    ExecutionMode,
+    UsageTresSource,
+)
 
 # Accepted values for the ``default_account_policy`` backend setting. An
 # unrecognized value (e.g. a typo) must fail loudly at construction rather than
@@ -58,6 +62,81 @@ class PeriodicSettingsMode(Enum):
     EMULATOR = "emulator"
 
 
+def parse_execution_mode(backend_settings: dict) -> ExecutionMode:
+    """The configured ``execution_mode``, rejecting unknown values."""
+    raw_execution_mode = backend_settings.get("execution_mode", ExecutionMode.CLI.value)
+    try:
+        return ExecutionMode(raw_execution_mode)
+    except ValueError as e:
+        # Fail loudly: silently degrading a typo ("rset") to CLI mode
+        # would mask a misconfigured deployment.
+        msg = f"Unknown SLURM execution_mode {raw_execution_mode!r} — expected 'cli' or 'rest'"
+        raise BackendError(msg) from e
+
+
+def parse_usage_tres_source(backend_settings: dict) -> UsageTresSource:
+    """The configured ``usage_tres_source``, rejecting unknown values."""
+    raw_source = backend_settings.get("usage_tres_source", UsageTresSource.REQUESTED.value)
+    try:
+        return UsageTresSource(raw_source)
+    except ValueError as e:
+        # A typo must not silently bill a different set of TRES.
+        msg = (
+            f"Unknown SLURM usage_tres_source {raw_source!r} — expected 'requested' or 'allocated'"
+        )
+        raise BackendError(msg) from e
+
+
+def create_slurm_client(backend_settings: dict, slurm_tres: dict) -> SlurmClientInterface:
+    """Build the SLURM client an offering's backend_settings describe.
+
+    The one place that turns ``slurm_bin_path``, ``cluster_name``,
+    ``execution_mode``, ``rest_api`` and ``usage_tres_source`` into a client,
+    shared by the backend and the account diagnostics CLI so both talk to the
+    same SLURM.
+    """
+    slurm_bin_path = backend_settings.get("slurm_bin_path", "/usr/bin")
+    cluster_name: Optional[str] = backend_settings.get("cluster_name")
+    usage_tres_source = parse_usage_tres_source(backend_settings)
+    if parse_execution_mode(backend_settings) is not ExecutionMode.REST:
+        return SlurmClient(
+            slurm_tres,
+            slurm_bin_path=slurm_bin_path,
+            cluster_name=cluster_name,
+            usage_tres_source=usage_tres_source,
+        )
+
+    rest_settings = backend_settings.get("rest_api")
+    if not rest_settings:
+        msg = "execution_mode is 'rest' but rest_api settings are missing"
+        raise BackendError(msg)
+    if not cluster_name:
+        msg = (
+            "execution_mode is 'rest' but cluster_name is not set — REST "
+            "association payloads require an explicit cluster"
+        )
+        raise BackendError(msg)
+    try:
+        from waldur_site_agent_slurm.rest_client import SlurmRestClient  # noqa: PLC0415
+    except ImportError as e:
+        # httpx is an unconditional base dependency, so a missing httpx is
+        # unlikely — surface the actual import error instead of always
+        # blaming the optional extra, which would misdirect debugging.
+        msg = (
+            f"execution_mode is 'rest' but the REST client failed to import: {e}. "
+            "If httpx is genuinely missing, install it with: "
+            "pip install 'waldur-site-agent-slurm[rest]'"
+        )
+        raise BackendError(msg) from e
+    return SlurmRestClient(
+        slurm_tres,
+        rest_settings=rest_settings,
+        cluster_name=cluster_name,
+        slurm_bin_path=slurm_bin_path,
+        usage_tres_source=usage_tres_source,
+    )
+
+
 class SlurmBackend(backends.BaseBackend):
     """Main class for management of SLURM resources."""
 
@@ -70,22 +149,9 @@ class SlurmBackend(backends.BaseBackend):
         """Init backend data and creates a corresponding client."""
         super().__init__(slurm_settings, slurm_tres)
         self.backend_type = BackendType.SLURM.value
-        slurm_bin_path = self.backend_settings.get("slurm_bin_path", "/usr/bin")
         self.cluster_name: Optional[str] = self.backend_settings.get("cluster_name")
-        raw_execution_mode = self.backend_settings.get("execution_mode", ExecutionMode.CLI.value)
-        try:
-            self.execution_mode = ExecutionMode(raw_execution_mode)
-        except ValueError as e:
-            # Fail loudly: silently degrading a typo ("rset") to CLI mode
-            # would mask a misconfigured deployment.
-            msg = f"Unknown SLURM execution_mode {raw_execution_mode!r} — expected 'cli' or 'rest'"
-            raise BackendError(msg) from e
-        if self.execution_mode is ExecutionMode.REST:
-            self.client: SlurmClientInterface = self._create_rest_client(slurm_tres, slurm_bin_path)
-        else:
-            self.client = SlurmClient(
-                slurm_tres, slurm_bin_path=slurm_bin_path, cluster_name=self.cluster_name
-            )
+        self.execution_mode = parse_execution_mode(self.backend_settings)
+        self.client: SlurmClientInterface = create_slurm_client(self.backend_settings, slurm_tres)
 
         # Optional LDAP integration for project groups
         self._ldap_client = None
@@ -97,7 +163,7 @@ class SlurmBackend(backends.BaseBackend):
         # qos_management.enabled configs keep create-and-attach + account
         # GrpTRESMins + classic qos= restore/pause.
         self._qos_config = self.backend_settings.get("qos_management", {}) or {}
-        # Set True in _pre_create_resource when a dedicated QoS was freshly
+        # Set True in _on_backend_resource_created when a dedicated QoS was freshly
         # created; consumed by _setup_resource_limits so RawUsage=0 runs only
         # then (never on a pre-existing/shared QoS name collision).
         self._qos_created_this_cycle = False
@@ -105,6 +171,7 @@ class SlurmBackend(backends.BaseBackend):
 
         # Optional project directory management
         self._project_dir_config = self.backend_settings.get("project_directory", {})
+        self._lustre_project_id_offset = self._validated_lustre_project_id_offset()
 
         # Account under which the top-tier account of the default hierarchy is created.
         # This is the real root of the SLURM account tree and is distinct from
@@ -157,47 +224,17 @@ class SlurmBackend(backends.BaseBackend):
         # Optional component mapping (Waldur components → SLURM TRES)
         self._component_mapper = ComponentMapper(slurm_tres)
 
-    def _create_rest_client(self, slurm_tres: dict, slurm_bin_path: str) -> "SlurmClientInterface":
-        """Build a SlurmRestClient from the rest_api backend settings.
-
-        The REST client lives behind an optional dependency (httpx), mirroring
-        the optional LDAP integration.
-        """
-        rest_settings = self.backend_settings.get("rest_api")
-        if not rest_settings:
-            msg = "execution_mode is 'rest' but rest_api settings are missing"
-            raise BackendError(msg)
-        if not self.cluster_name:
-            msg = (
-                "execution_mode is 'rest' but cluster_name is not set — REST "
-                "association payloads require an explicit cluster"
-            )
-            raise BackendError(msg)
-        try:
-            from waldur_site_agent_slurm.rest_client import SlurmRestClient  # noqa: PLC0415
-        except ImportError as e:
-            # httpx is an unconditional base dependency, so a missing httpx is
-            # unlikely — surface the actual import error instead of always
-            # blaming the optional extra, which would misdirect debugging.
-            msg = (
-                f"execution_mode is 'rest' but the REST client failed to import: {e}. "
-                "If httpx is genuinely missing, install it with: "
-                "pip install 'waldur-site-agent-slurm[rest]'"
-            )
-            raise BackendError(msg) from e
-        return SlurmRestClient(
-            slurm_tres,
-            rest_settings=rest_settings,
-            cluster_name=self.cluster_name,
-            slurm_bin_path=slurm_bin_path,
-        )
-
     def _pre_create_resource(
         self,
         waldur_resource: WaldurResource,
         user_context: Optional[dict] = None,
     ) -> None:
-        """Pre-creation setup: account hierarchy, LDAP groups, filesystem, QoS."""
+        """Pre-creation setup: the customer and project parent accounts.
+
+        Runs for every candidate ID the uniqueness retry tries, so nothing named
+        after the allocation's own ID belongs here -- see
+        ``_on_backend_resource_created``.
+        """
         if not waldur_resource.customer_slug or not waldur_resource.project_slug:
             logger.warning(
                 "Resource %s has unset or missing slug fields. customer_slug: %s, project_slug: %s",
@@ -214,8 +251,6 @@ class SlurmBackend(backends.BaseBackend):
             raise BackendError(msg)
 
         del user_context
-
-        resource_backend_id = self._get_resource_backend_id(waldur_resource.slug)
 
         parent_account = self.backend_settings.get("parent_account")
         if parent_account:
@@ -244,6 +279,17 @@ class SlurmBackend(backends.BaseBackend):
                 customer_backend_id,
             )
 
+    def _on_backend_resource_created(
+        self, resource_backend_id: str, waldur_resource: WaldurResource
+    ) -> None:
+        """Create the LDAP group, project directory and QoS of a new allocation.
+
+        Later operations (add_user, remove_user, delete_resource) address all
+        three by the persisted backend_id, so they are named after it, and only
+        once SLURM has accepted it as a new account.
+        """
+        del waldur_resource
+
         # Optional: create LDAP project group
         if self._ldap_client:
             try:
@@ -271,6 +317,49 @@ class SlurmBackend(backends.BaseBackend):
                     )
             else:
                 self._setup_account_qos(resource_backend_id)
+
+    def _heal_legacy_project_group(self, waldur_resource: WaldurResource) -> None:
+        """Rename a project group still named after the slug to the backend ID.
+
+        Before the group was named in ``_on_backend_resource_created`` it was
+        named after the resource slug, while every later lookup uses the
+        persisted backend_id. The two differ under the ``project_slug`` naming
+        policy or after a collision suffix, leaving such resources with a group
+        no lookup finds. A rename (modrdn) keeps the gidNumber and members, so
+        directory ownership and filesystem quotas keyed by the GID stay valid.
+        """
+        if not self._ldap_client:
+            return
+        backend_id = waldur_resource.backend_id
+        legacy_name = self._get_resource_backend_id(waldur_resource.slug)
+        if not backend_id or legacy_name == backend_id:
+            return
+        try:
+            if self._ldap_client.group_exists(backend_id):
+                return
+            if not self._ldap_client.group_exists(legacy_name):
+                return
+            if self.client.get_resource(legacy_name) is not None:
+                # The slug-derived name is a live SLURM account (another
+                # allocation, or the project account), so the group is its.
+                logger.warning(
+                    "LDAP project group %s is missing; not renaming %s to it, "
+                    "since %s is a SLURM account of its own",
+                    backend_id,
+                    legacy_name,
+                    legacy_name,
+                )
+                return
+            self._ldap_client.rename_group(legacy_name, backend_id)
+            logger.info(
+                "Renamed LDAP project group %s to the backend ID %s",
+                legacy_name,
+                backend_id,
+            )
+        except BackendError:
+            logger.exception(
+                "Failed to rename LDAP project group %s to %s", legacy_name, backend_id
+            )
 
     def sync_resource_project(
         self,
@@ -504,6 +593,9 @@ class SlurmBackend(backends.BaseBackend):
         logger.info("SLURM tres components:\n%s\n", pprint.pformat(self.backend_components))
 
         logger.info("SLURM execution mode: %s", self.execution_mode.value)
+        logger.info(
+            "SLURM usage TRES source: %s", parse_usage_tres_source(self.backend_settings).value
+        )
         try:
             slurm_version_info = self.client.get_version()
             logger.info("Slurm version: %s", slurm_version_info)
@@ -765,7 +857,12 @@ class SlurmBackend(backends.BaseBackend):
         return qos, partition
 
     def add_user(self, waldur_resource: WaldurResource, username: str, **kwargs: str) -> bool:
-        """Add user to SLURM account, with optional partition and LDAP group."""
+        """Add user to SLURM account, with optional partition and LDAP group.
+
+        A failed ``sacctmgr`` association raises BackendError; a failed LDAP
+        group add stays non-fatal (logged), since the SLURM association --
+        what grants access to the allocation -- exists.
+        """
         del kwargs
         resource_backend_id = waldur_resource.backend_id
         if not resource_backend_id.strip():
@@ -848,13 +945,19 @@ class SlurmBackend(backends.BaseBackend):
                     )
                 logger.info("Created association between %s and %s", username, resource_backend_id)
             except BackendError as err:
-                logger.exception("Unable to create association on backend: %s", err)
-                return False
+                # Raise rather than return False (see BaseBackend.add_user): the
+                # caller has to know this user is still missing on the cluster.
+                msg = (
+                    f"Unable to create association between {username} and "
+                    f"{resource_backend_id}: {err}"
+                )
+                raise BackendError(msg) from err
         else:
             logger.info("Association already exists, skipping creation")
 
         # Optional: add user to LDAP project group
         if self._ldap_client:
+            self._heal_legacy_project_group(waldur_resource)
             try:
                 self._ldap_client.add_user_to_group(resource_backend_id, username)
             except BackendError:
@@ -891,6 +994,7 @@ class SlurmBackend(backends.BaseBackend):
         # Optional: remove user from LDAP project group
         if self._ldap_client:
             resource_backend_id = waldur_resource.backend_id
+            self._heal_legacy_project_group(waldur_resource)
             try:
                 self._ldap_client.remove_user_from_group(resource_backend_id, username)
             except BackendError:
@@ -917,6 +1021,27 @@ class SlurmBackend(backends.BaseBackend):
             self.create_user_homedirs(existing_users, umask=umask)
 
     # ===== QOS AND FILESYSTEM MANAGEMENT =====
+
+    def _validated_lustre_project_id_offset(self) -> int:
+        """Return ``project_directory.lustre_quota.project_id_offset`` (default 0).
+
+        Schema validation only warns, so an unusable offset is refused here:
+        quietly falling back to the raw GID would tag project directories with
+        exactly the IDs the offset is meant to avoid.
+        """
+        lustre_config = (self._project_dir_config or {}).get("lustre_quota") or {}
+        offset = lustre_config.get("project_id_offset", 0)
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not 0 <= offset <= LUSTRE_MAX_PROJECT_ID
+        ):
+            msg = (
+                "project_directory.lustre_quota.project_id_offset must be an integer "
+                f"between 0 and {LUSTRE_MAX_PROJECT_ID}, got {offset!r}"
+            )
+            raise BackendError(msg)
+        return offset
 
     def _validate_qos_management_runtime_flags(self) -> None:
         """Re-assert the QoS management runtime invariants.
@@ -1088,10 +1213,23 @@ class SlurmBackend(backends.BaseBackend):
         if lustre_config and self._ldap_client:
             gid = self._ldap_client.get_group_gid(group_name)
             if gid is not None:
-                self._set_lustre_quota(gid, project_path, lustre_config)
+                lustre_project_id = gid + self._lustre_project_id_offset
+                if lustre_project_id > LUSTRE_MAX_PROJECT_ID:
+                    logger.error(
+                        "Skipping Lustre quota for %s: GID %d + project_id_offset %d "
+                        "exceeds the largest Lustre project ID %d",
+                        project_path,
+                        gid,
+                        self._lustre_project_id_offset,
+                        LUSTRE_MAX_PROJECT_ID,
+                    )
+                    return
+                self._set_lustre_quota(lustre_project_id, gid, project_path, lustre_config)
 
-    def _set_lustre_quota(self, gid: int, project_path: str, config: dict) -> None:
-        """Set Lustre filesystem quota for a project."""
+    def _set_lustre_quota(
+        self, lustre_project_id: int, gid: int, project_path: str, config: dict
+    ) -> None:
+        """Set Lustre filesystem quota for a project and tag its directory tree."""
         mount_point = config.get("mount_point", "/valhalla")
         block_soft = config.get("block_softlimit")
         block_hard = config.get("block_hardlimit")
@@ -1099,7 +1237,7 @@ class SlurmBackend(backends.BaseBackend):
         inode_hard = config.get("inode_hardlimit")
 
         try:
-            quota_cmd = ["lfs", "setquota", "-p", str(gid)]
+            quota_cmd = ["lfs", "setquota", "-p", str(lustre_project_id)]
             if block_soft is not None:
                 quota_cmd.extend(["-b", str(block_soft)])
             if block_hard is not None:
@@ -1117,15 +1255,22 @@ class SlurmBackend(backends.BaseBackend):
                     "lfs",
                     "project",
                     "-p",
-                    str(gid),
+                    str(lustre_project_id),
                     "-r",
                     "-s",
                     project_path,
                 ]
             )
-            logger.info("Set Lustre quota for GID %d on %s", gid, mount_point)
+            logger.info(
+                "Set Lustre quota for project ID %d (GID %d) on %s",
+                lustre_project_id,
+                gid,
+                mount_point,
+            )
         except BackendError:
-            logger.exception("Failed to set Lustre quota for GID %d", gid)
+            logger.exception(
+                "Failed to set Lustre quota for project ID %d (GID %d)", lustre_project_id, gid
+            )
 
     def _use_grp_submit_jobs_lever(self) -> bool:
         """True when pause/downscale/restore must not overwrite account QoS.
@@ -1428,6 +1573,7 @@ class SlurmBackend(backends.BaseBackend):
 
         # Clean up LDAP project group
         if self._ldap_client:
+            self._heal_legacy_project_group(waldur_resource)
             try:
                 self._ldap_client.delete_group(backend_id)
                 logger.info("Deleted LDAP project group %s", backend_id)
@@ -1477,7 +1623,7 @@ class SlurmBackend(backends.BaseBackend):
             converted_limits or resource_backend_limits, self.backend_components
         )
         logger.info("Setting resource backend limits to: \n%s", limits_str)
-        # Only reset RawUsage when _pre_create_resource just created this QoS.
+        # Only reset RawUsage when _on_backend_resource_created just created this QoS.
         reset_raw_usage = self._qos_created_this_cycle
         self._qos_created_this_cycle = False
         self._write_allocation_limits(

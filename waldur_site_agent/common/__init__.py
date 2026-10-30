@@ -11,6 +11,7 @@ and provide default values that can be overridden via environment variables.
 
 import os
 import sys
+from typing import Optional
 
 # Handle different Python versions
 if sys.version_info >= (3, 10):
@@ -33,6 +34,34 @@ WALDUR_SITE_AGENT_MEMBERSHIP_SYNC_PERIOD_MINUTES = int(
 WALDUR_SITE_AGENT_RECONCILIATION_PERIOD_MINUTES = int(
     os.environ.get("WALDUR_SITE_AGENT_RECONCILIATION_PERIOD_MINUTES", "60")
 )
-waldur_verify_ssl = os.getenv("WALDUR_VERIFY_SSL", "true").lower() in ("true", "yes")
+# Event mode: how long a STOMP consumer may stay disconnected (or an offering's
+# STOMP setup keep failing transiently) before the agent stops touching its
+# liveness heartbeat. Above the listener's own reconnect window (~10 min), so the
+# watchdog only acts once the listener has given up.
+WALDUR_SITE_AGENT_STOMP_UNHEALTHY_AFTER_MINUTES = float(
+    os.environ.get("WALDUR_SITE_AGENT_STOMP_UNHEALTHY_AFTER_MINUTES", "15")
+)
+
+# Event mode: a message handler running longer than this counts as a stuck queue
+# (it holds back every later message) and, past the STOMP unhealthy threshold,
+# withholds the liveness heartbeat. Well above normal order processing.
+WALDUR_SITE_AGENT_STOMP_HANDLER_STUCK_AFTER_MINUTES = float(
+    os.environ.get("WALDUR_SITE_AGENT_STOMP_HANDLER_STUCK_AFTER_MINUTES", "30")
+)
+# Event mode: how often to re-apply every resource's paused/downscaled status, so
+# a lost or skipped resource message is caught on the next pass. 0 disables it.
+WALDUR_SITE_AGENT_RESOURCE_STATUS_RECONCILIATION_MINUTES = float(
+    os.environ.get("WALDUR_SITE_AGENT_RESOURCE_STATUS_RECONCILIATION_MINUTES", "60")
+)
+
+# Waldur personal access tokens start with this prefix and are accepted only as
+# ``Authorization: Bearer``; a user's API token is sent as ``Token``.
+WALDUR_PAT_PREFIX = "w_"
+
+
+def static_token_prefix(token: Optional[str]) -> str:
+    """Return the Authorization scheme Waldur expects for a static API token."""
+    return "Bearer" if token and token.startswith(WALDUR_PAT_PREFIX) else "Token"
+
 
 WALDUR_SITE_AGENT_VERSION = version("waldur-site-agent")

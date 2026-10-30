@@ -19,7 +19,13 @@ from waldur_site_agent.backend import logger
 from waldur_site_agent.common import utils
 from waldur_site_agent.common.structures import Offering, UnifiedQueue
 from waldur_site_agent.event_processing import handlers
-from waldur_site_agent.event_processing.listener import WaldurListener, connect_to_stomp_server
+from waldur_site_agent.event_processing.listener import (
+    CONNECT_TIMEOUT,
+    STARTUP_CONNECT_ATTEMPTS,
+    WaldurListener,
+    connect_to_stomp_server,
+)
+from waldur_site_agent.event_processing.ws_proxy import ws_stomp_connection
 
 WALDUR_LISTENER_NAME = "waldur-listener"
 OBJECT_TYPE_TO_HANDLER_STOMP: dict[ObservableObjectTypeEnum, Callable] = {
@@ -37,7 +43,10 @@ OBJECT_TYPE_TO_HANDLER_STOMP: dict[ObservableObjectTypeEnum, Callable] = {
         handlers.on_offering_resources_sync_message_stomp
     ),
     ObservableObjectTypeEnum.RESOURCE_API_KEY_ROTATION: (
-        handlers.on_resource_api_key_rotation_stomp
+        handlers.on_resource_api_key_command_stomp
+    ),
+    ObservableObjectTypeEnum.SERVICE_PROVIDER_PROJECT_GROUP: (
+        handlers.on_project_group_message_stomp
     ),
 }
 
@@ -87,6 +96,9 @@ class EventSubscriptionManager:
         """Constructor."""
         self.waldur_rest_client = utils.get_client_for_offering(offering, user_agent, global_proxy)
         self.offering = offering
+        # The broker WebSocket uses the same proxy as the REST client: the explicit
+        # argument (federation target consumers) or the offering's global_proxy.
+        self.global_proxy = global_proxy or offering.global_proxy
         self.user_agent = user_agent
         self.on_connect_callback = on_connect_callback
         # A custom router may be injected (tests); default is payload routing.
@@ -99,6 +111,7 @@ class EventSubscriptionManager:
         custom_stomp_ws_host: Optional[str] = None,
         custom_stomp_ws_port: Optional[int] = None,
         custom_stomp_ws_path: Optional[str] = None,
+        on_queue_missing: Optional[Callable[[], None]] = None,
     ) -> stomp.WSStompConnection:
         """Create the STOMP connection to the unified consumer queue.
 
@@ -109,6 +122,7 @@ class EventSubscriptionManager:
                 web_stomp directly instead of the nginx proxy).
             custom_stomp_ws_port: broker port override.
             custom_stomp_ws_path: broker WebSocket path override.
+            on_queue_missing: re-registers the queue when the broker reports it gone.
 
         Returns:
             The constructed (not yet connected) STOMP connection.
@@ -125,20 +139,26 @@ class EventSubscriptionManager:
         queue_name = unified_queue.queue_name
 
         stomp_host = custom_stomp_ws_host or urllib3.util.parse_url(self.offering.api_url).host
-        stomp_port = custom_stomp_ws_port or (
-            443 if self.waldur_rest_client._verify_ssl else 80
-        )
+        # The default port follows whether the WebSocket uses TLS. verify_ssl only
+        # decides whether the certificate is checked: a self-signed https Waldur
+        # still serves web-STOMP on 443.
+        stomp_port = custom_stomp_ws_port or (443 if self.offering.websocket_use_tls else 80)
         ws_path = custom_stomp_ws_path or "/rmqws-stomp"
 
         logger.info("Using %s:%s/%s%s broker", stomp_host, stomp_port, vhost_name, ws_path)
         # reconnect_attempts_max=1: transport does a single attempt; app-level
         # retries with backoff live in connect_to_stomp_server() (listener.py).
-        connection = stomp.WSStompConnection(
+        connection = ws_stomp_connection(
+            proxy_url=self.global_proxy,
             host_and_ports=[(stomp_host, stomp_port)],
             ws_path=ws_path,
             vhost=vhost_name,
             reconnect_attempts_max=1,
             heartbeats=(10000, 10000),
+            # Bounds the WebSocket handshake. It also applies to reads, which is
+            # harmless: heartbeats arrive every 10 s and a 30 s silence is a dead
+            # connection anyway.
+            timeout=CONNECT_TIMEOUT,
         )
         if self.offering.websocket_use_tls:
             connection.set_ssl(for_hosts=[(stomp_host, stomp_port)])
@@ -154,6 +174,7 @@ class EventSubscriptionManager:
                 self.offering,
                 self.user_agent,
                 expose_backend_error_details=self.expose_backend_error_details,
+                on_queue_missing=on_queue_missing,
             ),
         )
 
@@ -174,12 +195,21 @@ class EventSubscriptionManager:
         self,
         unified_queue: UnifiedQueue,
         connection: stomp.WSStompConnection,
+        max_retries: int = STARTUP_CONNECT_ATTEMPTS,
     ) -> bool:
-        """Start (connect) the unified STOMP connection."""
+        """Start (connect) the unified STOMP connection, bounded by ``max_retries``.
+
+        On failure the connection is still usable: its listener and the event-mode
+        watchdog keep reconnecting it.
+        """
         try:
             logger.info("Starting unified STOMP connection for queue %s", unified_queue.queue_name)
             connect_to_stomp_server(
-                connection, unified_queue.rmq_username, self.offering.api_token
+                connection,
+                unified_queue.rmq_username,
+                self.offering.api_token,
+                max_retries=max_retries,
+                connect_timeout=CONNECT_TIMEOUT,
             )
             logger.info("Started unified STOMP connection for queue %s", unified_queue.queue_name)
         except Exception as e:
@@ -192,7 +222,11 @@ class EventSubscriptionManager:
         """Stop the STOMP connection.
 
         The unified queue itself is left in place so it is reused on the next
-        start (register_queue is idempotent).
+        start (register_queue is idempotent). Messages the worker has not handled
+        yet stay unacked, so the broker keeps them for the next start.
         """
+        listener = connection.get_listener(WALDUR_LISTENER_NAME)
+        if listener is not None:
+            listener.close()
         connection.remove_listener(WALDUR_LISTENER_NAME)
         connection.disconnect()

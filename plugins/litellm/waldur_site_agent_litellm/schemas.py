@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from waldur_site_agent.common.plugin_schemas import (
+    SECRET,
     PluginBackendSettingsSchema,
     PluginComponentSchema,
 )
@@ -30,7 +31,9 @@ class OpenWebUISettingsSchema(BaseModel):
     api_url: str = Field(
         ..., description="Open WebUI base URL for the admin API, e.g. https://chat.example.com"
     )
-    api_token: str = Field(..., description="Admin API token used to manage accounts")
+    api_token: str = Field(
+        ..., description="Admin API token used to manage accounts", json_schema_extra=SECRET
+    )
     url: Optional[str] = Field(
         default=None,
         description=(
@@ -52,6 +55,7 @@ class OpenWebUISettingsSchema(BaseModel):
             "Temporary password for accounts the agent creates; required when "
             "account_provisioning is 'managed_password'"
         ),
+        json_schema_extra=SECRET,
     )
     delete_accounts_on_removal: Optional[bool] = Field(
         default=False,
@@ -78,7 +82,8 @@ class LiteLLMBackendSettingsSchema(PluginBackendSettingsSchema):
         ..., description="LiteLLM proxy base URL, e.g. https://litellm.example.com"
     )
     api_token: str = Field(
-        ..., description="LiteLLM master or admin key used for the management API"
+        ..., description="LiteLLM master or admin key used for the management API",
+        json_schema_extra=SECRET
     )
     models: Optional[list] = Field(
         default=None,
@@ -86,7 +91,10 @@ class LiteLLMBackendSettingsSchema(PluginBackendSettingsSchema):
     )
     budget_duration: Optional[str] = Field(
         default=None,
-        description="Reset period for the max_budget backstop, e.g. '30d'",
+        description=(
+            "Ignored: the max_budget backstop always resets on the 1st of the month "
+            "('1mo'), the month Waldur counts limits in. Any other value is logged"
+        ),
     )
     tpm_limit: Optional[int] = Field(
         default=None, description="Default tokens-per-minute cap applied to each key"
@@ -100,6 +108,26 @@ class LiteLLMBackendSettingsSchema(PluginBackendSettingsSchema):
     )
     timeout: Optional[float] = Field(
         default=None, description="Per-request timeout in seconds (default 30)"
+    )
+    resource_backend_id_source: Literal["slug", "uuid"] = Field(
+        default="slug",
+        description=(
+            "What a new resource's backend id, and so its key aliases "
+            "'<backend_id>-<n>', derive from. 'slug' (default): allocation_prefix plus "
+            "the user-chosen resource slug, which can collide with hand-made keys on a "
+            "shared proxy. 'uuid': the resource UUID hex, which cannot. Existing "
+            "resources keep the backend id they were provisioned with"
+        ),
+    )
+    ownership_retention_months: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Calendar months, counting the current one, that a removed member's LiteLLM "
+            "user record is kept so the chat usage they had keeps billing to the "
+            "resource. Default 12; keep it at least the agent's reporting_periods, and "
+            "the same on every agent sharing the proxy"
+        ),
     )
     openwebui: Optional[OpenWebUISettingsSchema] = Field(
         default=None,
@@ -145,7 +173,8 @@ class LiteLLMUsageBackendSettingsSchema(PluginBackendSettingsSchema):
         ),
     )
     api_token: str = Field(
-        ..., description="LiteLLM master or admin key used for the spend API"
+        ..., description="LiteLLM master or admin key used for the spend API",
+        json_schema_extra=SECRET
     )
     verify_ssl: Optional[bool] = Field(
         default=None,

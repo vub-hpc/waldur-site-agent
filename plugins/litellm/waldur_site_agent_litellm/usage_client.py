@@ -113,8 +113,14 @@ class LiteLLMUsageClient:
     def get_user_usage_rows(self, start_date: str, end_date: str) -> list:
         """Return one row per (day, user, key) in the inclusive ``YYYY-MM-DD`` range.
 
-        Each row is ``{"user_id", "key_alias", "input_tokens", "output_tokens",
-        "token_cost"}``, where ``key_alias`` may be ``None``.
+        Each row is ``{"date", "user_id", "key_alias", "input_tokens", "output_tokens",
+        "token_cost"}``, where ``key_alias`` may be ``None``. A row with no alias also
+        carries ``day_key_aliases``: the aliases of every key served on that day, from
+        the ``api_keys`` breakdown, ``None`` for a key without one.
+
+        ``date`` is the proxy's UTC day (``YYYY-MM-DD``) the row was bucketed under. It
+        is what lets the caller bill the day to whoever owned the address on that day,
+        rather than to whoever owns it when the report runs.
 
         This is the chat surface's usage. Open WebUI authenticates every request with
         one shared virtual key and forwards the signed-in person's address, which the
@@ -132,34 +138,55 @@ class LiteLLMUsageClient:
         """
         rows: list = []
         for result in self._walk_results(start_date, end_date):
-            entities = (result.get("breakdown") or {}).get("entities") or {}
+            # The day alone: ownership periods are compared as ``YYYY-MM-DD`` strings,
+            # and a timestamp tail would put the last day of a period outside it.
+            date = str(result.get("date") or "")[:10]
+            breakdown = result.get("breakdown") or {}
+            entities = breakdown.get("entities") or {}
+            day_aliases: Optional[list] = None
             for user_id, record in entities.items():
                 if not isinstance(record, dict):
                     continue
                 by_key = record.get("api_key_breakdown") or {}
                 if by_key:
                     for key_record in by_key.values():
-                        row = self._to_user_row(str(user_id), key_record)
+                        row = self._to_user_row(date, str(user_id), key_record)
                         if row is not None:
                             rows.append(row)
                     continue
                 # No per-key split (an older proxy, or a record the proxy could not
-                # resolve a key for). The entity total is still the right number; it
-                # simply cannot be de-duplicated against the alias rows, so it is
-                # emitted with no alias and the caller counts it whole.
-                row = self._to_user_row(str(user_id), record)
+                # resolve a key for). The entity total cannot be told apart from the
+                # alias rows, and the address on it is whatever the request's header
+                # said: someone calling with their own key can name another person's.
+                # So it goes out with the day's keys, and the caller counts it only
+                # when none of them is a key it bills by alias.
+                row = self._to_user_row(date, str(user_id), record)
                 if row is not None:
+                    if day_aliases is None:
+                        day_aliases = self._day_key_aliases(breakdown)
+                    row["day_key_aliases"] = day_aliases
                     rows.append(row)
         return rows
 
     @staticmethod
-    def _to_user_row(user_id: str, record: object) -> Optional[dict]:
+    def _day_key_aliases(breakdown: dict) -> list:
+        """The alias of every key in one day's ``api_keys`` breakdown, ``None`` if unset."""
+        aliases: list = []
+        for record in (breakdown.get("api_keys") or {}).values():
+            metadata = record.get("metadata") if isinstance(record, dict) else None
+            alias = metadata.get("key_alias") if isinstance(metadata, dict) else None
+            aliases.append(str(alias) if alias else None)
+        return aliases
+
+    @staticmethod
+    def _to_user_row(date: str, user_id: str, record: object) -> Optional[dict]:
         """Map one entity (or entity-by-key) entry onto a usage row."""
         if not isinstance(record, dict):
             return None
         metrics = record.get("metrics") or {}
         alias = (record.get("metadata") or {}).get("key_alias")
         return {
+            "date": date,
             "user_id": user_id,
             "key_alias": str(alias) if alias else None,
             "input_tokens": int(metrics.get("prompt_tokens") or 0),
@@ -192,7 +219,8 @@ class LiteLLMUsageClient:
     def get_usage_rows(self, start_date: str, end_date: str) -> list:
         """Return one usage row per (day, key) in the inclusive ``YYYY-MM-DD`` range.
 
-        Each row is ``{"key_alias", "input_tokens", "output_tokens", "token_cost"}``.
+        Each row is ``{"date", "key_alias", "input_tokens", "output_tokens",
+        "token_cost"}``, ``date`` being the proxy's UTC day the row was bucketed under.
         Rows are *not* aggregated here — a key appears once per day it was used, and
         the caller sums them.
 
@@ -203,11 +231,12 @@ class LiteLLMUsageClient:
         """
         rows: list = []
         for result in self._walk_results(start_date, end_date):
+            date = str(result.get("date") or "")[:10]
             api_keys = (result.get("breakdown") or {}).get("api_keys") or {}
             for record in api_keys.values():
                 row = self._to_row(record)
                 if row is not None:
-                    rows.append(row)
+                    rows.append({"date": date, **row})
         return rows
 
     @staticmethod

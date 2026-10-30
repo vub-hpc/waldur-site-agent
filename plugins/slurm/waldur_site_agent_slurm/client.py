@@ -15,7 +15,17 @@ from waldur_site_agent.backend.exceptions import (
 )
 from waldur_site_agent.backend.structures import Association, ClientResource
 from waldur_site_agent_slurm.interface import SlurmClientInterface
-from waldur_site_agent_slurm.parser import SlurmAssociationLine, SlurmReportLine
+from waldur_site_agent_slurm.parser import (
+    SlurmAssociationLine,
+    SlurmReportLine,
+    pick_usage_tres,
+)
+from waldur_site_agent_slurm.schemas import UsageTresSource
+
+# sacct --format of a usage report; ``usage_tres_source: allocated`` also asks
+# for AllocTRES and the lines are folded back to the four-column shape.
+_USAGE_FIELDS = "Account,ReqTRES,Elapsed,User"
+_ALLOC_USAGE_FIELDS = "Account,AllocTRES,ReqTRES,Elapsed,User"
 
 _PARTITION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # QoS names share the partition character set; guards against sacctmgr injection.
@@ -44,11 +54,13 @@ class SlurmClient(SlurmClientInterface):
         slurm_tres: dict,
         slurm_bin_path: str = "/usr/bin",
         cluster_name: Optional[str] = None,
+        usage_tres_source: UsageTresSource = UsageTresSource.REQUESTED,
     ) -> None:
         """Inits SLURM-related data."""
         self.slurm_tres = slurm_tres
         self.slurm_bin_path = slurm_bin_path
         self.cluster_name = cluster_name
+        self.usage_tres_source = usage_tres_source
         self.executed_commands: list[str] = []
 
     def get_version(self) -> str:
@@ -366,21 +378,7 @@ class SlurmClient(SlurmClientInterface):
     ) -> list[SlurmReportLine]:
         """Generates per-user usage report for the accounts."""
         month_start, month_end = backend_utils.format_current_month(timezone or "")
-
-        args = [
-            "--noconvert",
-            "--truncate",
-            "--allocations",
-            "--allusers",
-            f"--starttime={month_start}",
-            f"--endtime={month_end}",
-            f"--accounts={','.join(resource_ids)}",
-            "--format=Account,ReqTRES,Elapsed,User",
-        ]
-        output = self._execute_command(args, "sacct", immediate=False)
-        return [
-            SlurmReportLine(line, self.slurm_tres) for line in output.splitlines() if "|" in line
-        ]
+        return self._usage_lines(resource_ids, month_start, month_end)
 
     def get_historical_usage_report(
         self, resource_ids: list[str], year: int, month: int
@@ -396,7 +394,19 @@ class SlurmClient(SlurmClientInterface):
             List of SlurmReportLine objects containing usage data for the specified month
         """
         month_start, month_end = backend_utils.format_month_period(year, month)
+        return self._usage_lines(resource_ids, month_start, month_end)
 
+    def _usage_lines(
+        self, resource_ids: list[str], month_start: str, month_end: str
+    ) -> list[SlurmReportLine]:
+        """Run sacct over the window and parse its ``Account|TRES|Elapsed|User`` lines.
+
+        With ``usage_tres_source: allocated`` sacct prints both AllocTRES and
+        ReqTRES; each line is folded back to the four-column shape with the
+        TRES picked by ``pick_usage_tres``, the same rule the REST client uses.
+        """
+        allocated = self.usage_tres_source is UsageTresSource.ALLOCATED
+        fields = _ALLOC_USAGE_FIELDS if allocated else _USAGE_FIELDS
         args = [
             "--noconvert",
             "--truncate",
@@ -405,12 +415,22 @@ class SlurmClient(SlurmClientInterface):
             f"--starttime={month_start}",
             f"--endtime={month_end}",
             f"--accounts={','.join(resource_ids)}",
-            "--format=Account,ReqTRES,Elapsed,User",
+            f"--format={fields}",
         ]
         output = self._execute_command(args, "sacct", immediate=False)
-        return [
-            SlurmReportLine(line, self.slurm_tres) for line in output.splitlines() if "|" in line
-        ]
+        lines = [line for line in output.splitlines() if "|" in line]
+        if allocated:
+            lines = [self._fold_alloc_line(line) for line in lines]
+        return [SlurmReportLine(line, self.slurm_tres) for line in lines]
+
+    def _fold_alloc_line(self, line: str) -> str:
+        """``Account|AllocTRES|ReqTRES|Elapsed|User`` -> ``Account|TRES|Elapsed|User``."""
+        parts = line.split("|")
+        if len(parts) != len(_ALLOC_USAGE_FIELDS.split(",")):
+            return line
+        account, alloc_tres, req_tres, elapsed, user = parts
+        tres = pick_usage_tres(self.usage_tres_source, alloc_tres, req_tres) or ""
+        return f"{account}|{tres}|{elapsed}|{user}"
 
     def get_resource_limits(self, resource_id: str) -> dict[str, int]:
         """Returns limits for the account."""
@@ -528,10 +548,15 @@ class SlurmClient(SlurmClientInterface):
 
     def list_active_user_jobs(self, account: str, user: str) -> list[str]:
         """List active jobs for the account and user."""
+        # -X drops the job steps (<id>.batch, <id>.0); --state keeps the jobs
+        # that are still queued or running. sacct refuses states it does not
+        # account, such as COMPLETING (sacct/options.c _supported_state).
         args = [
             "-a",
+            "-X",
             f"--account={account}",
             f"--user={user}",
+            "--state=PENDING,RUNNING,SUSPENDED,REQUEUED,RESIZING",
             "--format=JobID,JobName,Partition,Account,User,State,Elapsed,Timelimit,NodeList",
         ]
         output = self._execute_command(args, command_name="sacct", immediate=False)
@@ -895,24 +920,26 @@ class SlurmClient(SlurmClientInterface):
     def get_account_fairshare(self, account: str) -> int:
         """Get current fairshare value for account."""
         try:
+            # Fairshare belongs to the association: without ``withassoc``
+            # sacctmgr leaves the column empty.
             command = [
                 "list",
                 "account",
-                "format=account,fairshare",
+                "withassoc",
+                "format=account,user,fairshare",
                 "where",
                 f"account={account}",
             ]
             output = self._execute_command(command)
 
             for line in output.splitlines():
-                if "|" in line and account in line:
-                    parts = line.split("|")
-                    min_parts_for_fairshare = 2
-                    if len(parts) >= min_parts_for_fairshare:
-                        try:
-                            return int(parts[1])
-                        except ValueError:
-                            pass
+                parts = line.split("|")
+                min_parts_for_fairshare = 3
+                if len(parts) >= min_parts_for_fairshare and parts[0] == account and not parts[1]:
+                    try:
+                        return int(parts[2])
+                    except ValueError:
+                        pass
             return 0
 
         except BackendError as e:
@@ -921,10 +948,13 @@ class SlurmClient(SlurmClientInterface):
     def get_account_limits(self, account: str) -> dict:
         """Get current account limits (GrpTRESMins, MaxTRESMins, etc.)."""
         try:
+            # The limits belong to the association: without ``withassoc``
+            # sacctmgr leaves these columns empty.
             command = [
                 "list",
                 "account",
-                "format=account,grptres,grptresmin,maxtres,maxtresmin",
+                "withassoc",
+                "format=account,user,grptres,grptresmin,maxtres,maxtresmin",
                 "where",
                 f"account={account}",
             ]
@@ -938,20 +968,18 @@ class SlurmClient(SlurmClientInterface):
             }
 
             for line in output.splitlines():
-                if "|" in line and account in line:
-                    parts = line.split("|")
-                    min_parts_for_limits = 5
-                    if len(parts) >= min_parts_for_limits:
-                        # Parse TRES format and populate limits dict
-                        # This is simplified - production would need proper TRES parsing
-                        if parts[1]:  # GrpTRES
-                            limits["GrpTRES"] = self._parse_tres_string(parts[1])
-                        if parts[2]:  # GrpTRESMins
-                            limits["GrpTRESMins"] = self._parse_tres_string(parts[2])
-                        if parts[3]:  # MaxTRES
-                            limits["MaxTRES"] = self._parse_tres_string(parts[3])
-                        if parts[4]:  # MaxTRESMins
-                            limits["MaxTRESMins"] = self._parse_tres_string(parts[4])
+                parts = line.split("|")
+                min_parts_for_limits = 6
+                # The account row is the one without a user.
+                if len(parts) >= min_parts_for_limits and parts[0] == account and not parts[1]:
+                    if parts[2]:  # GrpTRES
+                        limits["GrpTRES"] = self._parse_tres_string(parts[2])
+                    if parts[3]:  # GrpTRESMins
+                        limits["GrpTRESMins"] = self._parse_tres_string(parts[3])
+                    if parts[4]:  # MaxTRES
+                        limits["MaxTRES"] = self._parse_tres_string(parts[4])
+                    if parts[5]:  # MaxTRESMins
+                        limits["MaxTRESMins"] = self._parse_tres_string(parts[5])
 
             return limits
 

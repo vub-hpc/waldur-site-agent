@@ -105,6 +105,10 @@ class WaldurBackend(backends.BaseBackend):
 
     # --- Abstract Method Implementations ---
 
+    def remote_waldur_base_urls(self) -> list[str]:
+        """Waldur B is this backend's target, so its errors are backend errors."""
+        return [self.client.base_url]
+
     def ping(self, raise_exception: bool = False) -> bool:
         """Check connectivity to Waldur B."""
         try:
@@ -1551,6 +1555,10 @@ class WaldurBackend(backends.BaseBackend):
 
     # --- Target Event Subscriptions ---
 
+    def expects_target_event_subscriptions(self) -> bool:
+        """Target STOMP on Waldur B is opened only when ``target_stomp_enabled``."""
+        return bool(self.backend_settings.get("target_stomp_enabled"))
+
     def setup_target_event_subscriptions(
         self,
         source_offering,
@@ -1615,6 +1623,9 @@ class WaldurBackend(backends.BaseBackend):
                 stomp_ws_path=getattr(source_offering, "stomp_ws_path", None),
                 websocket_use_tls=getattr(source_offering, "websocket_use_tls", True),
             )
+            # The config loader sets this on configured offerings; a synthetic one
+            # must carry it too, or clients built from it bypass the proxy.
+            target_offering._global_proxy = global_proxy
 
             # Register agent identity on Waldur B
             target_client = get_client(
@@ -1659,7 +1670,7 @@ class WaldurBackend(backends.BaseBackend):
                     return
                 handler = target_handlers.get(payload.get("object_type"))
                 if handler is None:
-                    # ack=auto: an unrouted message is gone, so say so loudly.
+                    # An unrouted message is acked and gone, so say so loudly.
                     logger.warning(
                         "No target handler for object_type %s, dropping",
                         payload.get("object_type"),

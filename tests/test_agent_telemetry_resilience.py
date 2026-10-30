@@ -160,6 +160,7 @@ class TestPollingAgentsSurviveRejectedIdentity(unittest.TestCase):
         self.config.waldur_site_agent_mode = "membership-sync"
         self.config.timezone = "UTC"
         self.config.reporting_periods = 1
+        self.config.api_key_final_report_days = 3
         self.config.global_proxy = None
         self.config.expose_backend_error_details = True
         self.config.log_shipping = mock.Mock(spec=structures.LogShippingConfig)
@@ -214,8 +215,8 @@ class TestPollingAgentsSurviveRejectedIdentity(unittest.TestCase):
 class TestEventPathSurvivesMissingIdentity(unittest.TestCase):
     """The event path treats the identity as telemetry too.
 
-    A STOMP message is delivered with ``ack="auto"``, so a handler that raises
-    neither requeues nor retries — an identity lookup must never be able to
+    A STOMP message whose handler raises is acked without a retry, so it is
+    neither requeued nor retried — an identity lookup must never be able to
     cost a real order or membership event.
     """
 

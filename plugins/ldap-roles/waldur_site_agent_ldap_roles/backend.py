@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import uuid as uuid_lib
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from waldur_api_client.api.marketplace_provider_resource_projects import (
     marketplace_provider_resource_projects_list,
@@ -28,6 +28,7 @@ from waldur_site_agent_ldap_client import LdapClient
 from waldur_site_agent.backend import backends
 from waldur_site_agent.backend.exceptions import BackendError
 from waldur_site_agent.backend.structures import BackendResourceInfo
+from waldur_site_agent.common import static_token_prefix
 
 from .translator import DesiredGroup, Grant, build_grants, diff_members, group_grants
 
@@ -72,6 +73,13 @@ class LdapRolesBackend(backends.BaseBackend):
     #: add_user/remove_user call, i.e. one full re-sync per user per cycle.
     skip_resource_team_diff = True
 
+    #: Groups are created by order processing and reconciled by membership
+    #: sync; there is no usage to report.
+    supported_roles: ClassVar[tuple[backends.BackendRole, ...]] = (
+        backends.BackendRole.ORDER_PROCESSING,
+        backends.BackendRole.MEMBERSHIP_SYNC,
+    )
+
     def __init__(
         self,
         backend_settings: dict,
@@ -112,7 +120,7 @@ class LdapRolesBackend(backends.BaseBackend):
             self.waldur_client = AuthenticatedClient(
                 base_url=api_url.rstrip("/").removesuffix("/api"),
                 token=api_token,
-                prefix="Token",
+                prefix=static_token_prefix(api_token),
                 verify_ssl=backend_settings.get("waldur_verify_ssl", True),
             )
 
@@ -615,8 +623,9 @@ class LdapRolesBackend(backends.BaseBackend):
         try:
             self.pull_resource(waldur_resource)
         except Exception as exc:
-            logger.warning("ldap-roles add_user re-sync failed: %s", exc)
-            return False
+            # The grant did not reach LDAP: a backend failure, not a skip.
+            msg = f"ldap-roles re-sync after granting {username} failed: {exc}"
+            raise BackendError(msg) from exc
         return True
 
     def remove_user(

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any, Optional
+import re
+from typing import Any, ClassVar, Optional
 
 from waldur_api_client.models.resource import Resource as WaldurResource
 
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 # field name it reads counts from.
 TOKEN_COMPONENTS = ("input_tokens", "output_tokens")
 
+# Warehouse row field naming the key a row's usage came through, when the usage shipper
+# records it. ``client_id`` stays the resource's backend id either way, so the resource
+# total does not depend on it.
+KEY_CLIENT_ID_FIELD = "key_client_id"
+
 _REPORT_ONLY = "usage reporting backend is reporting-only and does not manage resources"
 
 
@@ -32,6 +38,10 @@ class EnvoyUsageReportingBackend(backends.BaseBackend):
     """Reports token usage from the usage warehouse to Waldur."""
 
     supports_decreasing_usage: bool = True
+    supported_roles: ClassVar[tuple[backends.BackendRole, ...]] = (backends.BackendRole.REPORTING,)
+    # Rows the usage shipper tags with the key they came through are also summed per
+    # key, which is what Waldur enforces a key's limits against.
+    supports_resource_api_key_usage: bool = True
 
     def __init__(
         self, backend_settings: dict[str, Any], backend_components: dict[str, Any]
@@ -103,10 +113,65 @@ class EnvoyUsageReportingBackend(backends.BaseBackend):
                 totals[key] += int(row.get(key) or 0)
         return report
 
+    @staticmethod
+    def _current_month() -> str:
+        return datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m")
+
     def _get_usage_report(self, resource_backend_ids: list[str]) -> dict:
         """Usage for the current month."""
-        month = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m")
+        month = self._current_month()
         return self._collect_usage(resource_backend_ids, month, month)
+
+    def get_resource_key_usage_report(
+        self, resource_backend_ids: list[str]
+    ) -> dict[str, Optional[dict[str, dict[str, float]]]]:
+        """The current month's usage per key, for rows the shipper attributed to a key.
+
+        Reads the same rows as the resource total, so the per-key figures sum to it.
+        A resource with a non-zero row that names no key of its own — usage shipped
+        before the shipper recorded keys, say — maps to None: splitting only part of
+        the total across keys would under-count against their limits.
+        """
+        return self._key_usage(resource_backend_ids, self._current_month())
+
+    def get_resource_key_usage_report_for_period(
+        self, resource_backend_ids: list[str], year: int, month: int
+    ) -> dict[str, Optional[dict[str, dict[str, float]]]]:
+        """A closed month's usage per key, read as ``get_resource_key_usage_report`` reads it."""
+        return self._key_usage(resource_backend_ids, f"{year:04d}-{month:02d}")
+
+    def _key_usage(
+        self, resource_backend_ids: list[str], month: str
+    ) -> dict[str, Optional[dict[str, dict[str, float]]]]:
+        report: dict[str, Optional[dict[str, dict[str, float]]]] = {
+            backend_id: {} for backend_id in resource_backend_ids
+        }
+        if not resource_backend_ids or not self._token_keys:
+            return report
+        patterns = {
+            backend_id: re.compile(rf"^{re.escape(backend_id)}-\d+$")
+            for backend_id in resource_backend_ids
+        }
+        for row in self.usage_client.get_usage(resource_backend_ids, month, month):
+            backend_id = str(row.get("client_id") or "")
+            keys = report.get(backend_id)
+            if keys is None:
+                # Not one of ours, or a resource already found unattributable.
+                continue
+            usage = {key: int(row.get(key) or 0) for key in self._token_keys}
+            key_client_id = row.get(KEY_CLIENT_ID_FIELD)
+            if not key_client_id or not patterns[backend_id].match(str(key_client_id)):
+                if any(usage.values()):
+                    logger.info(
+                        "Usage of %s is not attributed to its keys; not reporting it per key",
+                        backend_id,
+                    )
+                    report[backend_id] = None
+                continue
+            totals = keys.setdefault(str(key_client_id), dict.fromkeys(self._token_keys, 0))
+            for key, value in usage.items():
+                totals[key] += value
+        return report
 
     def get_usage_report_for_period(
         self,
