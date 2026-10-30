@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -20,6 +21,7 @@ _PARTITION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # QoS names share the partition character set; guards against sacctmgr injection.
 _QOS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+WALDUR_SCRIPT_PREFIX = "/usr/local/bin/"
 
 class SlurmClient(SlurmClientInterface):
     """This class implements Python client for SLURM.
@@ -982,3 +984,10 @@ class SlurmClient(SlurmClientInterface):
                 billing_units += usage * weight
 
         return billing_units
+
+    def create_linux_user_homedir(self, username: str, umask: str = "") -> str:
+        """Creates homedir for the user in Linux system."""
+        waldur_make_homedir_vsc = os.path.join(WALDUR_SCRIPT_PREFIX, "waldur_make_homedir_vsc")
+        command = ["sudo", waldur_make_homedir_vsc, username]
+        logger.info(f"Executing: {' '.join(command)}")
+        return self.execute_command(command)

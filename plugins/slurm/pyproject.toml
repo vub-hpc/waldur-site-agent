@@ -1,6 +1,6 @@
 [project]
 name = "waldur-site-agent-slurm"
-version = "1.0.8rc4"
+version = "1.0.8rc4.post2"
 description = "SLURM plugin for Waldur Site Agent"
 readme = "README.md"
 authors = [{ name = "OpenNode Team", email = "info@opennodecloud.com" }]
